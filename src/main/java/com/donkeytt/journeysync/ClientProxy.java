@@ -1,4 +1,4 @@
-package com.myname.mymodid;
+package com.donkeytt.journeysync;
 
 public class ClientProxy extends CommonProxy {
 
