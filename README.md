@@ -62,29 +62,15 @@ Join a server — everything else is automatic. Progress is reported in chat.
 
 ## How It Works
 
-```mermaid
-flowchart LR
-    subgraph A["Player A — Explorer"]
-        JM["JourneyMap renders<br/>tiles to disk"]
-        Scan["Watcher: 5s mtime scan<br/>+ SHA-1 compare"]
-        Up["Chunked upload<br/>(ACKed, rate-limited)"]
-        JM --> Scan --> Up
-    end
+Sync follows one lifecycle, repeated on every join:
 
-    subgraph S["Server — Authoritative"]
-        Store["<world>/journeysync/<br/>manifest.json · tiles/<br/>waypoints.json"]
-    end
-
-    subgraph B["Player B — Everyone Online"]
-        Down["Chunked download<br/>(only missing/changed)"]
-        Write["Atomic PNG write<br/>temp file + move"]
-        Clear["JmBridge reflection<br/>RegionImageCache.clear()"]
-        Down --> Write --> Clear
-    end
-
-    Up -- "new/changed tiles & waypoints" --> Store
-    Store -- "broadcast / on join" --> Down
-```
+| Phase | What happens |
+|---|---|
+| **1. Handshake** | Client connects, announces itself. Server replies with its configuration and the current manifest (every tile's SHA-1, gzipped) plus all shared waypoints. |
+| **2. Diff** | Client compares the manifest against (a) tiles already on disk and (b) hashes it synced last time. Anything missing or changed goes onto a download list; anything it has that the server doesn't goes onto an upload list. Identical content on both sides is skipped entirely. |
+| **3. Transfer** | Tiles move in both directions as Schematica-style ACKed chunks (≤ 24 KB per packet, token-bucket rate limited). Each tile is verified against its SHA-1 before being accepted. Progress is reported in chat. |
+| **4. Apply** | Downloaded tiles are written to the JourneyMap cache as temp files + atomic move, then `RegionImageCache.clear()` is called via reflection so JourneyMap re-reads them from disk. Waypoint changes are written likewise, followed by `WaypointStore.reset()`. |
+| **5. Watch** | The client then scans its cache every 5 seconds. New tiles JourneyMap renders (exploration) or new waypoints the player creates are hashed and uploaded incrementally; tiles and waypoints pushed by other players arrive and are applied the same way as in phase 4. |
 
 <details>
 <summary><b>More detail</b></summary>
