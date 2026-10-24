@@ -36,7 +36,11 @@
 dependencies {
     // JourneyMap (dev runtime only, reflection integration — not a compile or publish dependency).
     // Copy journeymap-1.7.10-5.2.10-unlimited.jar into libs/ (gitignored).
-    devOnlyNonPublishable(rfg.deobf(files("libs/journeymap-1.7.10-5.2.10-unlimited.jar")))
+    // Optional: the integration is reflection-based, so CI builds work without the jar.
+    def jmJar = file("libs/journeymap-1.7.10-5.2.10-unlimited.jar")
+    if (jmJar.exists()) {
+        devOnlyNonPublishable(rfg.deobf(files(jmJar)))
+    }
     testImplementation("junit:junit:4.13.2")
     //runtimeOnlyNonPublishable("com.github.GTNewHorizons:NotEnoughItems:2.7.69-GTNH:dev")
 }
