@@ -1,0 +1,14 @@
+journeysync.chat.sync_start=JourneySync：开始同步（需下载 %d 个瓦片，上传 %d 个）
+journeysync.chat.sync_complete=JourneySync：初始同步完成，正在监视地图变化
+journeysync.chat.sync_progress=JourneySync：进度 - 已下载 %d/%d，已上传 %d/%d
+journeysync.chat.paused=JourneySync：同步已暂停
+journeysync.chat.resumed=JourneySync：同步已恢复
+journeysync.chat.status=JourneySync：%s
+journeysync.chat.usage=用法：%s
+journeysync.chat.version_mismatch=JourneySync：与服务端协议版本不匹配，同步已禁用
+journeysync.status.offline=未连接
+journeysync.status.handshake=握手中
+journeysync.status.scanning=正在扫描本地缓存
+journeysync.status.syncing=同步中
+journeysync.status.watching=监视中
+journeysync.status.progress=下载 %d/%d，上传 %d/%d
