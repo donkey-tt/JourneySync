@@ -62,11 +62,28 @@ Join a server — everything else is automatic. Progress is reported in chat.
 
 ## How It Works
 
-```
-Player A's JM renders tiles to disk ──(5s mtime scan)──> SHA-1 compare ──> chunked upload
-                                                                              │
-                                                                              v
-Player B <── PNG written (temp file + atomic move) ── RegionImageCache.clear() <── server
+```mermaid
+flowchart LR
+    subgraph A["Player A — Explorer"]
+        JM["JourneyMap renders<br/>tiles to disk"]
+        Scan["Watcher: 5s mtime scan<br/>+ SHA-1 compare"]
+        Up["Chunked upload<br/>(ACKed, rate-limited)"]
+        JM --> Scan --> Up
+    end
+
+    subgraph S["Server — Authoritative"]
+        Store["<world>/journeysync/<br/>manifest.json · tiles/<br/>waypoints.json"]
+    end
+
+    subgraph B["Player B — Everyone Online"]
+        Down["Chunked download<br/>(only missing/changed)"]
+        Write["Atomic PNG write<br/>temp file + move"]
+        Clear["JmBridge reflection<br/>RegionImageCache.clear()"]
+        Down --> Write --> Clear
+    end
+
+    Up -- "new/changed tiles & waypoints" --> Store
+    Store -- "broadcast / on join" --> Down
 ```
 
 <details>
