@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🗺️ JourneySync
+# JourneySync
 
 **One map, drawn together — 所有人的足迹，绘成同一张地图。**
 
@@ -17,40 +17,40 @@ waypoints through the server — so every player on a server shares one collecti
 *一个 Forge 1.7.10（GTNH）双端 mod：通过服务器同步 JourneyMap 的地图瓦片与信标，
 让所有玩家共同绘制同一张地图。*
 
-[Installation](#-installation) ·
-[Usage](#-usage) ·
-[How It Works](#-how-it-works) ·
-[Configuration](#-configuration) ·
-[Building](#-building) ·
-[Architecture](#-architecture) ·
+[Installation](#installation) ·
+[Usage](#usage) ·
+[How It Works](#how-it-works) ·
+[Configuration](#configuration) ·
+[Building](#building) ·
+[Architecture](#architecture) ·
 [中文](#中文)
 
 </div>
 
 ---
 
-## ✨ Features
+## Features
 
 | | |
 |---|---|
-| 🌍 **Full sync on join** | Download everything the community has explored, then stay in sync in real time — bidirectional, incremental. |
-| 📍 **Shared waypoints** | Create a waypoint, everyone sees it. Only the owner (or an OP) can delete it; deletions propagate as tombstones. |
-| 🔁 **Resume where you left off** | Per-server sync state means reconnecting only transfers what actually changed. |
-| 🧠 **Server-authoritative** | All data aggregated under `<world>/journeysync/` — conflicts resolved by last-write-wins with SHA-1 dedup. |
-| 🛡️ **Graceful degradation** | No JourneyMap on the client? No JourneySync on the server? Nothing breaks — everyone just plays normally. |
-| 🧩 **Zero hard dependency** | JourneyMap 5.2.10 is resolved at runtime via reflection; nothing is required at compile time. |
-| 🗣️ **Bilingual** | Chat messages and status output in English and 中文. |
+| **Full sync on join** | Download everything the community has explored, then stay in sync in real time — bidirectional, incremental. |
+| **Shared waypoints** | Create a waypoint, everyone sees it. Only the owner (or an OP) can delete it; deletions propagate as tombstones. |
+| **Resume where you left off** | Per-server sync state means reconnecting only transfers what actually changed. |
+| **Server-authoritative** | All data aggregated under `<world>/journeysync/` — conflicts resolved by last-write-wins with SHA-1 dedup. |
+| **Graceful degradation** | No JourneyMap on the client? No JourneySync on the server? Nothing breaks — everyone just plays normally. |
+| **Zero hard dependency** | JourneyMap 5.2.10 is resolved at runtime via reflection; nothing is required at compile time. |
+| **Bilingual** | Chat messages and status output in English and 中文. |
 
 ---
 
-## 📦 Installation
+## Installation
 
 1. Drop the jar into the **`mods/` folder of both the server and every client**.
 2. That's it. Sync starts automatically when a player joins.
 
 > **Requires:** Minecraft 1.7.10 · Forge · [JourneyMap](https://journeymap.info) 5.2.10 *(soft dependency — the mod idles harmlessly without it)*
 
-## 🎮 Usage
+## Usage
 
 Join a server — everything else is automatic. Progress is reported in chat.
 
@@ -60,7 +60,7 @@ Join a server — everything else is automatic. Progress is reported in chat.
 | `/jsync pause` | Pause syncing |
 | `/jsync resume` | Resume syncing |
 
-## 🔧 How It Works
+## How It Works
 
 ```
 Player A's JM renders tiles to disk ──(5s mtime scan)──> SHA-1 compare ──> chunked upload
@@ -70,7 +70,7 @@ Player B <── PNG written (temp file + atomic move) ── RegionImageCache.c
 ```
 
 <details>
-<summary><b>🔍 More detail</b></summary>
+<summary><b>More detail</b></summary>
 
 - **Tiles** — JourneyMap writes 512×512 PNG tiles under `DIM<dim>/{day|night|<vSlice>}/<rx>,<rz>.png`.
   JourneySync watches that directory: anything new or changed is hashed and uploaded; the server
@@ -84,7 +84,7 @@ Player B <── PNG written (temp file + atomic move) ── RegionImageCache.c
 
 </details>
 
-## ⚙️ Configuration
+## Configuration
 
 `config/journeysync.cfg`
 
@@ -96,7 +96,7 @@ Player B <── PNG written (temp file + atomic move) ── RegionImageCache.c
 | `scanIntervalSeconds` | `5` | How often the local cache is scanned for changes |
 | `logDebug` | `false` | Verbose logging |
 
-## 🏗️ Building
+## Building
 
 ```bash
 ./gradlew build        # spotless + unit tests; jar lands in build/libs
@@ -104,7 +104,7 @@ Player B <── PNG written (temp file + atomic move) ── RegionImageCache.c
 
 For a dev environment, copy a `journeymap-1.7.10-5.2.10-unlimited.jar` into `libs/` (gitignored).
 
-## 🧬 Architecture
+## Architecture
 
 JourneyMap 5.2.10 has no plugin API on 1.7.10, so integration is **file-level + three public
 methods via reflection**, all isolated in `client/JmBridge.java`:
@@ -142,6 +142,6 @@ com.donkeytt.journeysync/
 
 <div align="center">
 
-Made with ❤️ for the GTNH community · [MIT License](LICENSE)
+Made for the GTNH community · [MIT License](LICENSE)
 
 </div>
