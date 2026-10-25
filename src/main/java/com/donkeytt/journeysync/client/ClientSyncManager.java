@@ -92,6 +92,13 @@ public class ClientSyncManager {
     private final Map<Integer, IncomingTransfer> pushedTransfers = new HashMap<Integer, IncomingTransfer>();
     private final Map<Byte, BlobAssembly> blobs = new HashMap<Byte, BlobAssembly>();
 
+    /**
+     * Full-waypoint blob received before the JM directory was resolved. Unlike the manifest (a
+     * plain field), applying waypoints touches the filesystem, so it must wait for jmDir - and
+     * silently writing into the process CWD is not an acceptable fallback.
+     */
+    private String pendingWaypointBlob;
+
     private RateLimiter rateLimiter = new RateLimiter(0);
 
     // progress
@@ -125,6 +132,7 @@ public class ClientSyncManager {
         localSha1.clear();
         localMtime.clear();
         localSize.clear();
+        pendingWaypointBlob = null;
         jmDir = null;
         jmTiles = null;
 
@@ -213,6 +221,11 @@ public class ClientSyncManager {
                 if (!ensureJmDir()) {
                     break;
                 }
+                if (pendingWaypointBlob != null) {
+                    String blob = pendingWaypointBlob;
+                    pendingWaypointBlob = null;
+                    applyWaypointBlob(blob);
+                }
                 String job = downloadQueue.poll();
                 if (job != null) {
                     doDownload(job);
@@ -260,6 +273,13 @@ public class ClientSyncManager {
             // the event queue; anything reaching here is stale and can be dropped.
         } else if (ev instanceof BlobPacket) {
             onBlobFragment((BlobPacket) ev);
+        } else if (ev instanceof WaypointBlobEvent) {
+            String json = ((WaypointBlobEvent) ev).json;
+            if (jmDir == null) {
+                pendingWaypointBlob = json;
+            } else {
+                applyWaypointBlob(json);
+            }
         }
     }
 
@@ -721,7 +741,19 @@ public class ClientSyncManager {
             serverManifest = Manifest.fromJson(json);
             JourneySync.LOG.info("Received manifest: {} tiles", serverManifest.tiles.size());
         } else if (type == PacketHandler.BLOB_WAYPOINTS_FULL) {
-            applyWaypointBlob(json);
+            // Route through the worker: applying writes waypoint files, which requires jmDir -
+            // not yet resolved this early after join. dispatch() stashes it until then.
+            events.offer(new WaypointBlobEvent(json));
+        }
+    }
+
+    /** Worker-queue wrapper for a full-waypoint blob (see {@link #pendingWaypointBlob}). */
+    private static final class WaypointBlobEvent {
+
+        final String json;
+
+        WaypointBlobEvent(String json) {
+            this.json = json;
         }
     }
 
