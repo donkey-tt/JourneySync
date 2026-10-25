@@ -11,6 +11,7 @@ import net.minecraft.entity.player.EntityPlayerMP;
 import com.donkeytt.journeysync.Config;
 import com.donkeytt.journeysync.JourneySync;
 import com.donkeytt.journeysync.data.Manifest;
+import com.donkeytt.journeysync.data.PixelMerge;
 import com.donkeytt.journeysync.data.TileEntry;
 import com.donkeytt.journeysync.data.TileKey;
 import com.donkeytt.journeysync.data.WaypointRecord;
@@ -171,11 +172,27 @@ public class ServerSyncManager {
         }
         TileKey key = TileKey.parse(transfer.relPath);
         byte[] data = transfer.getData();
+
+        // The shared map is incremental: merge the upload into the stored tile (union of explored
+        // pixels) instead of overwriting it. A partial or stale render can then never shrink the
+        // shared map, and clients always receive the merged accumulation of everyone's renders.
+        try {
+            if (tileFiles.exists(key)) {
+                byte[] stored = tileFiles.read(key);
+                byte[] merged = PixelMerge.mergePng(stored, data);
+                if (merged != null) {
+                    data = merged;
+                }
+            }
+        } catch (Exception e) {
+            JourneySync.LOG.warn("Tile merge failed for {}, storing upload as-is", key.relPath(), e);
+        }
+
         String sha1 = Hashing.sha1Hex(data);
 
         TileEntry existing = manifest.tiles.get(key.relPath());
         if (existing != null && existing.sha1.equals(sha1)) {
-            sendTo(player, new TileUploadAckPacket(transfer.transferId, 1)); // duplicate
+            sendTo(player, new TileUploadAckPacket(transfer.transferId, 1)); // duplicate (or nothing new after merge)
             return;
         }
 
