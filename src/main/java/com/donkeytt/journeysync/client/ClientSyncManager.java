@@ -1,6 +1,12 @@
 package com.donkeytt.journeysync.client;
 
 import java.io.File;
+import java.nio.file.ClosedWatchServiceException;
+import java.nio.file.Path;
+import java.nio.file.StandardWatchEventKinds;
+import java.nio.file.WatchEvent;
+import java.nio.file.WatchKey;
+import java.nio.file.WatchService;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
@@ -111,6 +117,16 @@ public class ClientSyncManager {
     /** relPath -> epoch millis before which another regression-restore of that tile is allowed. */
     private final Map<String, Long> restoreQuietUntil = new HashMap<String, Long>();
 
+    /**
+     * relPath -> epoch millis before which an upload of that tile must add genuinely new pixels.
+     * Set when a pushed/downloaded tile is applied: two clients rendering the same chunks produce
+     * slightly different pixels (dithering, lighting timing), and without this quiet period each
+     * side's re-render looks like a "change" against the other's version - the two clients would
+     * upload the same tile back and forth forever, flipping the shared map on every push.
+     */
+    private final Map<String, Long> inboundQuietUntil = new HashMap<String, Long>();
+    private static final long INBOUND_QUIET_MILLIS = 120_000;
+
     // progress
     private int totalToDownload;
     private int downloaded;
@@ -125,11 +141,19 @@ public class ClientSyncManager {
     private volatile boolean needsWaypointReset;
     private final BlockingQueue<String> chatQueue = new LinkedBlockingQueue<String>();
 
+    // Immediate file-watch pipeline: a JourneyMap tile write lands here and runs through the
+    // same guard chain within one worker tick, instead of waiting for the next periodic scan.
+    private WatchService tileWatcher;
+    private Thread tileWatcherThread;
+    private final BlockingQueue<String> watchQueue = new LinkedBlockingQueue<String>();
+    private volatile File watchBaseDir;
+
     private ClientSyncManager() {}
 
     // ------------------------------------------------------------------ lifecycle
 
     public void onConnect() {
+        stopTileWatcher();
         phase = Phase.AWAIT_MANIFEST;
         announcedComplete = false;
         serverManifest = null;
@@ -147,6 +171,7 @@ public class ClientSyncManager {
         jmTiles = null;
         uploadQuietUntil.clear();
         restoreQuietUntil.clear();
+        inboundQuietUntil.clear();
 
         serverId = computeServerId();
         helloSent = false;
@@ -259,7 +284,8 @@ public class ClientSyncManager {
                         chatQueue.offer("journeysync.chat.sync_complete");
                     }
                 }
-                if (phase == Phase.WATCHING && now - lastScanMillis > Config.scanIntervalSeconds * 1000L) {
+                if (phase == Phase.WATCHING
+                    && (now - lastScanMillis > Config.scanIntervalSeconds * 1000L || !watchQueue.isEmpty())) {
                     incrementalScan();
                 }
                 maybeProgressChat(now);
@@ -311,11 +337,14 @@ public class ClientSyncManager {
             byte[] data = transfer.getData();
             jmTiles.writeAtomic(key, data);
             writeShadow(key.relPath(), data);
+            inboundQuietUntil.put(key.relPath(), System.currentTimeMillis() + INBOUND_QUIET_MILLIS);
             String sha1 = Hashing.sha1Hex(data);
             noteLocalTile(key.relPath(), sha1, System.currentTimeMillis(), data.length);
             state.syncedTiles
                 .put(key.relPath(), new ClientState.TileState(sha1, System.currentTimeMillis(), data.length));
-            needsRegionClear = true;
+            if (!JmBridge.refreshTile(jmDir, key, data)) {
+                needsRegionClear = true;
+            }
             PacketHandler.wrapper.sendToServer(new TileAckPacket(transfer.transferId, true));
             saveStateQuietly();
         } catch (Exception e) {
@@ -382,11 +411,14 @@ public class ClientSyncManager {
             byte[] data = transfer.getData();
             jmTiles.writeAtomic(key, data);
             writeShadow(relPath, data);
+            inboundQuietUntil.put(relPath, System.currentTimeMillis() + INBOUND_QUIET_MILLIS);
             String sha1 = Hashing.sha1Hex(data);
             long now = System.currentTimeMillis();
             noteLocalTile(relPath, sha1, now, data.length);
             state.syncedTiles.put(relPath, new ClientState.TileState(sha1, now, data.length));
-            needsRegionClear = true;
+            if (!JmBridge.refreshTile(jmDir, key, data)) {
+                needsRegionClear = true;
+            }
             downloaded++;
             saveStateQuietly();
             PacketHandler.wrapper.sendToServer(new TileAckPacket(transfer.transferId, true));
@@ -507,7 +539,21 @@ public class ClientSyncManager {
                 uploadQuietUntil.put(relPath, System.currentTimeMillis() + Config.tileUploadCooldownSeconds * 1000L);
             }
             noteLocalTile(relPath, sha1, file.lastModified(), data.length);
-            state.syncedTiles.put(relPath, new ClientState.TileState(sha1, file.lastModified(), data.length));
+            com.donkeytt.journeysync.data.TileEntry serverEntry = serverManifest == null ? null
+                : serverManifest.tiles.get(relPath);
+            if (ack.code == 1 && serverEntry != null && !serverEntry.sha1.equals(sha1)) {
+                // Absorbed by a merge: the server kept a version different from ours (the union
+                // of ours with other clients' pixels). Adopt it as our sync point and pull it so
+                // the local disk/display converge to the merged map; otherwise the next scans
+                // would re-upload our subset forever.
+                state.syncedTiles
+                    .put(relPath, new ClientState.TileState(serverEntry.sha1, System.currentTimeMillis(), serverEntry.size));
+                enqueueRestore(relPath);
+            } else {
+                state.syncedTiles
+                    .put(relPath, new ClientState.TileState(sha1, file.lastModified(), data.length));
+                writeShadow(relPath, data); // our bytes are now the server-side reference for pixel checks
+            }
             saveStateQuietly();
         } else {
             JourneySync.LOG.warn("Upload rejected by server (code {}): {}", ack.code, relPath);
@@ -537,6 +583,7 @@ public class ClientSyncManager {
         }
         jmDir = dir;
         jmTiles = new TileFiles(dir);
+        startTileWatcher(dir);
         JourneySync.LOG.info("JourneyMap cache directory: {}", dir);
         return true;
     }
@@ -550,6 +597,7 @@ public class ClientSyncManager {
 
     /** Incremental scan while watching: only re-hash files whose mtime/size changed. */
     private void incrementalScan() {
+        drainWatchEvents();
         scanTiles(false);
         reconcileWithServer();
         scanWaypoints();
@@ -598,34 +646,175 @@ public class ClientSyncManager {
                 continue;
             }
             String relPath = prefix + "/" + name;
-            TileKey key = TileKey.parse(relPath);
-            if (key == null) {
+            if (TileKey.parse(relPath) == null) {
                 continue;
             }
             seen.add(relPath);
-            long mtime = f.lastModified();
-            long size = f.length();
+            processTileFile(f, relPath);
+        }
+    }
 
-            String known = localSha1.get(relPath);
-            if (known != null && localMtime.get(relPath) == mtime && localSize.get(relPath) == size) {
-                // Stat unchanged since the last scan - but a previously deferred tile may now
-                // have stayed stable long enough to upload.
-                maybeEnqueueSettled(relPath, mtime, size);
-                continue; // unchanged
+    /**
+     * The full per-file guard chain, shared by the directory scan and the file watcher: stat
+     * fast path, recorded-stat fast path, hash, then the upload guard chain (or restore, for
+     * regressions). Anything that wants a local tile evaluated funnels through here.
+     */
+    private void processTileFile(File f, String relPath) {
+        long mtime = f.lastModified();
+        long size = f.length();
+
+        String known = localSha1.get(relPath);
+        if (known != null && localMtime.get(relPath) == mtime && localSize.get(relPath) == size) {
+            // Stat unchanged since the last scan - but a previously deferred tile may now
+            // have stayed stable long enough to upload.
+            maybeEnqueueSettled(relPath, mtime, size);
+            return; // unchanged
+        }
+        // Fast path: reuse the recorded synced hash when the file matches the recorded stat.
+        ClientState.TileState recorded = state.syncedTiles.get(relPath);
+        if (recorded != null && recorded.mtime == mtime && recorded.size == size) {
+            noteLocalTile(relPath, recorded.sha1, mtime, size);
+            uploadSettler.clear(relPath);
+            return;
+        }
+        try {
+            String sha1 = Hashing.sha1Hex(f);
+            noteLocalTile(relPath, sha1, mtime, size);
+            maybeEnqueueUpload(relPath, recorded, sha1, mtime, size);
+        } catch (Exception e) {
+            JourneySync.LOG.error("Failed hashing {}", f, e);
+        }
+    }
+
+    // ------------------------------------------------------------------ file watcher
+
+    /**
+     * Watch the tile kind directories (DIM0/day, DIM0/night, ...) so a JourneyMap tile write
+     * runs the guard chain within one worker tick instead of waiting for the next periodic
+     * scan. Only directories that already exist are registered; dimension folders created
+     * later are picked up on the next connect. Degrades silently to scan-interval detection
+     * when watching is unavailable.
+     */
+    private void startTileWatcher(File base) {
+        stopTileWatcher();
+        try {
+            WatchService watcher = base.toPath()
+                .getFileSystem()
+                .newWatchService();
+            int registered = 0;
+            File[] dims = base.listFiles();
+            if (dims != null) {
+                for (File dim : dims) {
+                    if (!dim.isDirectory() || !dim.getName()
+                        .startsWith("DIM")) {
+                        continue;
+                    }
+                    File[] kinds = dim.listFiles();
+                    if (kinds == null) {
+                        continue;
+                    }
+                    for (File kind : kinds) {
+                        if (kind.isDirectory()) {
+                            kind.toPath()
+                                .register(
+                                    watcher,
+                                    StandardWatchEventKinds.ENTRY_CREATE,
+                                    StandardWatchEventKinds.ENTRY_MODIFY);
+                            registered++;
+                        }
+                    }
+                }
             }
-            // Fast path: reuse the recorded synced hash when the file matches the recorded stat.
-            ClientState.TileState recorded = state.syncedTiles.get(relPath);
-            if (recorded != null && recorded.mtime == mtime && recorded.size == size) {
-                noteLocalTile(relPath, recorded.sha1, mtime, size);
-                uploadSettler.clear(relPath);
-                continue;
+            if (registered == 0) {
+                watcher.close();
+                return;
             }
+            tileWatcher = watcher;
+            watchBaseDir = base;
+            watchQueue.clear();
+            tileWatcherThread = new Thread(new Runnable() {
+
+                @Override
+                public void run() {
+                    watchLoop(watcher);
+                }
+            }, "JourneySync-TileWatcher");
+            tileWatcherThread.setDaemon(true);
+            tileWatcherThread.start();
+            JourneySync.LOG.info("Watching {} tile directories for immediate change detection", registered);
+        } catch (Exception e) {
+            JourneySync.LOG.warn("Tile watch unavailable; falling back to scan-interval detection only", e);
+            tileWatcher = null;
+            watchBaseDir = null;
+        }
+    }
+
+    private void stopTileWatcher() {
+        if (tileWatcher != null) {
             try {
-                String sha1 = Hashing.sha1Hex(f);
-                noteLocalTile(relPath, sha1, mtime, size);
-                maybeEnqueueUpload(relPath, recorded, sha1, mtime, size);
-            } catch (Exception e) {
-                JourneySync.LOG.error("Failed hashing {}", f, e);
+                tileWatcher.close();
+            } catch (Exception ignored) {
+                // already closed
+            }
+            tileWatcher = null;
+        }
+        if (tileWatcherThread != null) {
+            tileWatcherThread.interrupt();
+            tileWatcherThread = null;
+        }
+        watchBaseDir = null;
+        watchQueue.clear();
+    }
+
+    private void watchLoop(WatchService watcher) {
+        while (true) {
+            WatchKey key;
+            try {
+                key = watcher.take();
+            } catch (ClosedWatchServiceException e) {
+                return; // watcher closed (disconnect / reconnect)
+            } catch (InterruptedException e) {
+                return;
+            }
+            for (WatchEvent<?> event : key.pollEvents()) {
+                if (event.kind() == StandardWatchEventKinds.OVERFLOW) {
+                    continue;
+                }
+                String name = String.valueOf(event.context());
+                if (!name.endsWith(".png") || name.contains(".sync-conflict")) {
+                    continue;
+                }
+                File base = watchBaseDir;
+                if (base == null) {
+                    continue;
+                }
+                String relPath = base.toPath()
+                    .relativize(((Path) key.watchable()).resolve(name))
+                    .toString()
+                    .replace('\\', '/');
+                if (TileKey.parse(relPath) != null) {
+                    watchQueue.offer(relPath);
+                }
+            }
+            if (!key.reset()) {
+                return;
+            }
+        }
+    }
+
+    /**
+     * Feed queued watch events through the same per-file guard chain as the periodic scan.
+     * Files younger than the write grace period are skipped: a partial write must never be
+     * hashed into the local record or judged by the pixel guards (the next event or the
+     * periodic scan sees the completed file).
+     */
+    private void drainWatchEvents() {
+        long now = System.currentTimeMillis();
+        String relPath;
+        while ((relPath = watchQueue.poll()) != null) {
+            File f = new File(jmDir, relPath);
+            if (f.isFile() && now - f.lastModified() > 500) {
+                processTileFile(f, relPath);
             }
         }
     }
@@ -701,7 +890,8 @@ public class ClientSyncManager {
      * clobbers synced tiles with partial re-renders whenever its region cache is incomplete (our
      * cache clears make it worse); without this, the local view silently rots even though the
      * server stays correct. Rate-limited so a persistent JM re-render fight costs at most one
-     * download per minute per tile.
+     * download per 15 seconds per tile - short enough that a re-rendered dip recovers almost
+     * immediately, long enough to keep the fight cheap.
      */
     private void enqueueRestore(String relPath) {
         if (!Config.downloadEnabled || serverManifest == null || !serverManifest.tiles.containsKey(relPath)) {
@@ -712,7 +902,7 @@ public class ClientSyncManager {
         if (until != null && now < until.longValue()) {
             return;
         }
-        restoreQuietUntil.put(relPath, now + 60_000);
+        restoreQuietUntil.put(relPath, now + 15_000);
         if (!downloadQueue.contains(relPath)) {
             downloadQueue.add(relPath);
             JourneySync.LOG.debug("Local tile regressed; restoring from server: {}", relPath);
@@ -798,7 +988,11 @@ public class ClientSyncManager {
      * JourneyMap re-renders tiles from stale in-memory region data whenever its cache is
      * incomplete; the result is a strict subset of the server's version that would clobber newer
      * shared content on upload. Size alone cannot separate that from compression jitter (a 4%
-     * content loss looks like a 4% re-encode), so the decision is pixel-level.
+     * content loss looks like a 4% re-encode), so the decision is pixel-level. While a tile is in
+     * its inbound quiet period (a pushed/downloaded version was just applied), color-only changes
+     * no longer count - two clients rendering the same chunks differ by dithering noise, and
+     * treating that as "new" makes them ping-pong the tile back and forth; only genuinely new
+     * pixels (real exploration) may upload.
      */
     private boolean addsNoNewPixels(String relPath, byte[] localData) {
         com.donkeytt.journeysync.data.TileEntry entry = serverManifest == null ? null
@@ -816,10 +1010,25 @@ public class ClientSyncManager {
                 .equals(entry.sha1)) {
                 return false; // shadow predates the server's current version; cannot judge
             }
+            if (isInboundQuiet(relPath)) {
+                return !PixelInfo.addsNewPixelsStrict(localData, reference);
+            }
             return !PixelInfo.addsNewPixels(localData, reference);
         } catch (Exception e) {
             return false;
         }
+    }
+
+    private boolean isInboundQuiet(String relPath) {
+        Long until = inboundQuietUntil.get(relPath);
+        if (until == null) {
+            return false;
+        }
+        if (System.currentTimeMillis() >= until.longValue()) {
+            inboundQuietUntil.remove(relPath);
+            return false;
+        }
+        return true;
     }
 
     private boolean addsNoNewPixels(String relPath) {

@@ -21,13 +21,13 @@ public class Config {
     // transfer
     /** 0 = unlimited */
     public static int rateLimitKBps = 0;
-    public static int scanIntervalSeconds = 5;
+    public static int scanIntervalSeconds = 2;
     public static int chunkSizeBytes = 24 * 1024;
     public static int maxTileBytes = 32 * 1024 * 1024;
     /** 0 = upload as soon as a change is detected (no debounce) */
-    public static int uploadSettleSeconds = 3;
+    public static int uploadSettleSeconds = 2;
     /** 0 = no cooldown between uploads of the same tile */
-    public static int tileUploadCooldownSeconds = 300;
+    public static int tileUploadCooldownSeconds = 60;
 
     public static void synchronizeConfiguration(File configFile) {
         Configuration configuration = new Configuration(configFile);

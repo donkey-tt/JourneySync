@@ -35,6 +35,16 @@ public final class JmBridge {
     private static Object waypointStore;
     private static Method waypointReset;
 
+    // targeted single-tile texture refresh (falls back to the full cache clear when unavailable)
+    private static boolean tileRefreshResolved;
+    private static Method mapTypeDay;
+    private static Method mapTypeNight;
+    private static Method regionCoordFromRegionPos;
+    private static Method getRegionImageSet;
+    private static Method getHolder;
+    private static Method holderGetTexture;
+    private static Method textureSetImage;
+
     private static long lastRegionClear;
     private static long lastWaypointReset;
 
@@ -77,6 +87,27 @@ public final class JmBridge {
             waypointReset = storeClass.getMethod("reset");
         } catch (Throwable t) {
             JourneySync.LOG.error("JourneyMap WaypointStore integration unavailable", t);
+        }
+        try {
+            Class<?> mapTypeClass = Class.forName("journeymap.client.model.MapType");
+            mapTypeDay = mapTypeClass.getMethod("day", int.class);
+            mapTypeNight = mapTypeClass.getMethod("night", int.class);
+            Class<?> coordClass = Class.forName("journeymap.client.model.RegionCoord");
+            regionCoordFromRegionPos = coordClass
+                .getMethod("fromRegionPos", File.class, int.class, int.class, int.class);
+            Class<?> cacheClass = Class.forName("journeymap.client.model.RegionImageCache");
+            getRegionImageSet = cacheClass.getMethod("getRegionImageSet", coordClass);
+            // getHolder is protected on the abstract ImageSet; only the concrete RegionImageSet
+            // widens it to public.
+            Class<?> regionImageSetClass = Class.forName("journeymap.client.model.RegionImageSet");
+            getHolder = regionImageSetClass.getMethod("getHolder", mapTypeClass);
+            Class<?> holderClass = Class.forName("journeymap.client.model.ImageHolder");
+            holderGetTexture = holderClass.getMethod("getTexture");
+            Class<?> textureClass = Class.forName("journeymap.client.render.texture.TextureImpl");
+            textureSetImage = textureClass.getMethod("setImage", java.awt.image.BufferedImage.class, boolean.class);
+            tileRefreshResolved = true;
+        } catch (Throwable t) {
+            JourneySync.LOG.error("JourneyMap targeted tile refresh unavailable; falling back to full cache clears", t);
         }
     }
 
@@ -138,6 +169,51 @@ public final class JmBridge {
             if (ConfigDebugOnce.log("regionclear")) {
                 JourneySync.LOG.error("RegionImageCache.clear failed", t);
             }
+        }
+    }
+
+    /**
+     * Update a single tile's GL texture from freshly applied bytes. A full
+     * {@link #clearRegionImageCache()} expires every viewed tile's texture at once and makes JM
+     * re-render all of them from its in-memory region data - stale regions flicker and each
+     * re-render can overwrite the freshly restored file. Pushing the new pixels into just this
+     * tile's texture avoids that storm entirely. Returns false when the targeted route is
+     * unavailable and the caller should fall back to the full clear.
+     */
+    public static boolean refreshTile(File worldDir, com.donkeytt.journeysync.data.TileKey key, byte[] png) {
+        resolve();
+        if (!tileRefreshResolved || worldDir == null) {
+            return false;
+        }
+        if (!"day".equals(key.kind) && !"night".equals(key.kind)) {
+            return false; // cave/underground layers use vSlice-typed MapTypes; keep the full clear
+        }
+        try {
+            Object mapType = ("night".equals(key.kind) ? mapTypeNight : mapTypeDay).invoke(null, key.dimension);
+            Object coord = regionCoordFromRegionPos.invoke(null, worldDir, key.regionX, key.regionZ, key.dimension);
+            Object set = getRegionImageSet.invoke(regionImageCache, coord);
+            if (set == null) {
+                return true; // not live in JM's cache; its next draw reads the file we wrote
+            }
+            Object holder = getHolder.invoke(set, mapType);
+            if (holder == null) {
+                return true; // this map type isn't cached for the region
+            }
+            Object texture = holderGetTexture.invoke(holder);
+            if (texture == null) {
+                return true; // no live texture; next draw builds from the file we wrote
+            }
+            java.awt.image.BufferedImage img = javax.imageio.ImageIO.read(new java.io.ByteArrayInputStream(png));
+            if (img == null) {
+                return false;
+            }
+            textureSetImage.invoke(texture, img, true);
+            return true;
+        } catch (Throwable t) {
+            if (ConfigDebugOnce.log("tilerefresh")) {
+                JourneySync.LOG.error("Targeted tile refresh failed", t);
+            }
+            return false;
         }
     }
 
