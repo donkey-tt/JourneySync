@@ -27,10 +27,6 @@ public final class TileFiles {
         }
     }
 
-    public File baseDir() {
-        return baseDir;
-    }
-
     /**
      * Resolve a tile key to a file under the base dir. The result is guaranteed to stay inside the
      * base directory.

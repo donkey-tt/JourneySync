@@ -89,13 +89,7 @@ public class ServerSyncManager {
                 "Player {} has JourneySync but no JourneyMap; sync will be inactive on their client",
                 player.getCommandSenderName());
         }
-        sendTo(
-            player,
-            new HelloAckPacket(
-                PacketHandler.PROTOCOL_VERSION,
-                manifest.epoch,
-                waypointStore.epoch,
-                Config.rateLimitKBps));
+        sendTo(player, new HelloAckPacket(PacketHandler.PROTOCOL_VERSION, Config.rateLimitKBps));
         sendManifest(player);
         sendWaypoints(player);
     }
@@ -206,13 +200,7 @@ public class ServerSyncManager {
 
         manifest.tiles.put(
             key.relPath(),
-            new TileEntry(
-                sha1,
-                System.currentTimeMillis(),
-                data.length,
-                player.getUniqueID()
-                    .toString()));
-        manifest.epoch++;
+            new TileEntry(sha1, data.length));
         dirty = true;
         sendTo(player, new TileUploadAckPacket(transfer.transferId, 0));
 

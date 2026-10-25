@@ -13,7 +13,6 @@ public class Config {
     public static final String CATEGORY_TRANSFER = "transfer";
 
     // general
-    public static boolean syncEnabled = true;
     public static boolean uploadEnabled = true;
     public static boolean downloadEnabled = true;
     public static boolean logDebug = false;
@@ -32,8 +31,6 @@ public class Config {
     public static void synchronizeConfiguration(File configFile) {
         Configuration configuration = new Configuration(configFile);
 
-        syncEnabled = configuration
-            .getBoolean("syncEnabled", CATEGORY_GENERAL, syncEnabled, "Master switch for JourneySync");
         uploadEnabled = configuration.getBoolean(
             "uploadEnabled",
             CATEGORY_GENERAL,
@@ -94,9 +91,5 @@ public class Config {
         if (configuration.hasChanged()) {
             configuration.save();
         }
-    }
-
-    public static boolean rateLimited() {
-        return rateLimitKBps > 0;
     }
 }

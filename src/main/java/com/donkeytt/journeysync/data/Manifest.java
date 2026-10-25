@@ -12,8 +12,7 @@ import com.google.gson.GsonBuilder;
  * The server-authoritative tile index: relative path -> {@link TileEntry}.
  *
  * <p>
- * Serialized with Gson, gzipped and transferred in {@code BlobPacket}s. {@link #epoch} bumps on
- * every accepted upload so clients can cheaply detect server-side changes in future versions.
+ * Serialized with Gson, gzipped and transferred in {@code BlobPacket}s.
  * </p>
  */
 public class Manifest {
@@ -21,7 +20,6 @@ public class Manifest {
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting()
         .create();
 
-    public long epoch;
     public Map<String, TileEntry> tiles = new LinkedHashMap<String, TileEntry>();
 
     public String toJson() {

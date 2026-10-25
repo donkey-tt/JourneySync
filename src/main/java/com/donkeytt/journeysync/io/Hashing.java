@@ -35,7 +35,7 @@ public final class Hashing {
         return toHex(newDigest().digest(data));
     }
 
-    public static MessageDigest newDigest() {
+    private static MessageDigest newDigest() {
         try {
             return MessageDigest.getInstance("SHA-1");
         } catch (NoSuchAlgorithmException e) {
@@ -43,7 +43,7 @@ public final class Hashing {
         }
     }
 
-    public static String toHex(byte[] bytes) {
+    private static String toHex(byte[] bytes) {
         char[] out = new char[bytes.length * 2];
         for (int i = 0; i < bytes.length; i++) {
             int v = bytes[i] & 0xff;

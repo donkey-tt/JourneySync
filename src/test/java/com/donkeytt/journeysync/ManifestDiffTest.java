@@ -17,7 +17,7 @@ public class ManifestDiffTest {
     private Manifest manifestWith(String... pathHashPairs) {
         Manifest m = new Manifest();
         for (int i = 0; i < pathHashPairs.length; i += 2) {
-            m.tiles.put(pathHashPairs[i], new TileEntry(pathHashPairs[i + 1], 1L, 10, "u"));
+            m.tiles.put(pathHashPairs[i], new TileEntry(pathHashPairs[i + 1], 10));
         }
         return m;
     }
@@ -39,7 +39,7 @@ public class ManifestDiffTest {
         // JM re-rendered a synced tile from incomplete region data: the synced hash still
         // matches the server, but the shrunken local file must be restored from the server.
         Manifest m = new Manifest();
-        m.tiles.put("DIM0/day/a.png", new TileEntry("h1", 1L, 100_000, "u"));
+        m.tiles.put("DIM0/day/a.png", new TileEntry("h1", 100_000));
         Map<String, String> local = new HashMap<String, String>();
         local.put("DIM0/day/a.png", "hSmall");
         Map<String, String> synced = new HashMap<String, String>();
@@ -67,7 +67,7 @@ public class ManifestDiffTest {
     @Test
     public void uploadSkipsRegressionAgainstServerVersion() {
         Manifest m = new Manifest();
-        m.tiles.put("DIM0/day/a.png", new TileEntry("hFull", 1L, 100_000, "u"));
+        m.tiles.put("DIM0/day/a.png", new TileEntry("hFull", 100_000));
         Map<String, String> local = new HashMap<String, String>();
         local.put("DIM0/day/a.png", "hPartial");
         Map<String, Long> sizes = new HashMap<String, Long>();
@@ -97,9 +97,7 @@ public class ManifestDiffTest {
     @Test
     public void jsonRoundTrip() {
         Manifest m = manifestWith("DIM0/day/a.png", "abc", "DIM-1/night/0,0.png", "def");
-        m.epoch = 42;
         Manifest parsed = Manifest.fromJson(m.toJson());
-        assertEquals(42, parsed.epoch);
         assertEquals(2, parsed.tiles.size());
         assertEquals("abc", parsed.tiles.get("DIM0/day/a.png").sha1);
     }

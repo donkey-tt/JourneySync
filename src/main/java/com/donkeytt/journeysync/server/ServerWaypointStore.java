@@ -27,7 +27,7 @@ public class ServerWaypointStore {
     private final File file;
     private final Map<String, WaypointRecord> byId = new LinkedHashMap<String, WaypointRecord>();
 
-    /** Bumped on every accepted change; clients use it to detect stale state. */
+    /** Revision sequence: every accepted change assigns {@code rev = ++epoch} to its record. */
     public long epoch;
 
     public ServerWaypointStore(File file) {
