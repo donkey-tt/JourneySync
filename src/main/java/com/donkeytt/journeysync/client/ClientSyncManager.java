@@ -66,6 +66,7 @@ public class ClientSyncManager {
     private volatile boolean paused;
     private String serverId = "unknown";
     private int serverRateLimitKBps;
+    private volatile boolean helloSent;
 
     // --- worker ---
     private final BlockingQueue<Object> events = new LinkedBlockingQueue<Object>();
@@ -128,6 +129,7 @@ public class ClientSyncManager {
         jmTiles = null;
 
         serverId = computeServerId();
+        helloSent = false;
         stateFile = new File(
             new File(Minecraft.getMinecraft().mcDataDir, "config/journeysync"),
             "state-" + serverId + ".json");
@@ -138,8 +140,10 @@ public class ClientSyncManager {
 
         startWorker();
 
-        PacketHandler.wrapper.sendToServer(new HelloPacket(JmBridge.isJourneyMapLoaded(), Tags.VERSION));
-        JourneySync.LOG.info("Connected to server, sent Hello (serverId={})", serverId);
+        // The client may tick before the server login completes, but never vice versa: defer the
+        // Hello to the first tick where the player exists, so the server is guaranteed past login
+        // (sending during ClientConnectedToServerEvent is silently dropped by FML mid-handshake).
+        JourneySync.LOG.info("Connected to server (serverId={}), waiting for join to send Hello", serverId);
     }
 
     public void onDisconnect() {
@@ -766,6 +770,14 @@ public class ClientSyncManager {
     // ------------------------------------------------------------------ tick-facing
 
     public void onClientTick() {
+        if (!helloSent) {
+            if (Minecraft.getMinecraft().thePlayer == null) {
+                return;
+            }
+            helloSent = true;
+            PacketHandler.wrapper.sendToServer(new HelloPacket(JmBridge.isJourneyMapLoaded(), Tags.VERSION));
+            JourneySync.LOG.info("Joined world, sent Hello (serverId={})", serverId);
+        }
         if (needsRegionClear) {
             needsRegionClear = false;
             JmBridge.clearRegionImageCache();

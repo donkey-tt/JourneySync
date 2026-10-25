@@ -43,8 +43,14 @@ public class HelloPacket implements IMessage {
 
         @Override
         public IMessage onMessage(HelloPacket message, MessageContext ctx) {
+            net.minecraft.entity.player.EntityPlayerMP player = ctx.getServerHandler().playerEntity;
+            if (player == null) {
+                // Arrived before login completed; the client re-sends on its next tick boundary,
+                // so dropping is safe.
+                return null;
+            }
             com.donkeytt.journeysync.server.ServerSyncManager.instance()
-                .onHello(ctx.getServerHandler().playerEntity, message);
+                .onHello(player, message);
             return null;
         }
     }
