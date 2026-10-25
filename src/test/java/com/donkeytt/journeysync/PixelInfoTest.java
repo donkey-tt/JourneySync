@@ -119,6 +119,84 @@ public class PixelInfoTest {
     }
 
     @Test
+    public void mixedRenderWithNetLossIsRejected() throws Exception {
+        // JourneyMap re-rendered from incomplete region data: it regained a thin sliver of the
+        // explored area but lost far more of it - uploading would clobber the fuller version.
+        BufferedImage ref = image(64, 64);
+        BufferedImage local = image(64, 64);
+        for (int y = 0; y < 40; y++) {
+            for (int x = 0; x < 40; x++) {
+                ref.setRGB(x, y, 0xff336699);
+            }
+        }
+        for (int y = 0; y < 10; y++) { // only the top strip survived the stale re-render
+            for (int x = 0; x < 40; x++) {
+                local.setRGB(x, y, 0xff336699);
+            }
+        }
+        local.setRGB(50, 50, 0xffaa0000); // a handful of genuinely new pixels
+        local.setRGB(51, 50, 0xffaa0000);
+        assertFalse(PixelInfo.addsNewPixels(write(local, "a.png"), write(ref, "b.png")));
+    }
+
+    @Test
+    public void mixedRenderWithNetGainIsAccepted() throws Exception {
+        // Mostly the same explored area plus real new exploration and a tiny dropout - net gain
+        // must upload.
+        BufferedImage ref = image(64, 64);
+        BufferedImage local = image(64, 64);
+        for (int y = 0; y < 40; y++) {
+            for (int x = 0; x < 40; x++) {
+                ref.setRGB(x, y, 0xff336699);
+                local.setRGB(x, y, 0xff336699);
+            }
+        }
+        local.setRGB(39, 39, 0); // one lost pixel
+        for (int i = 0; i < 40; i++) { // a real swath of new exploration
+            local.setRGB(i, 50, 0xffaa0000);
+        }
+        assertTrue(PixelInfo.addsNewPixels(write(local, "a.png"), write(ref, "b.png")));
+    }
+
+    @Test
+    public void strictModeIgnoresColorChangesButKeepsNewPixels() throws Exception {
+        // Two clients rendering the same chunks differ by dithering noise: many color changes,
+        // no new pixels. Normal mode treats large changes as real; strict (inbound quiet) mode
+        // must not, or the two clients ping-pong the tile back and forth.
+        BufferedImage ref = image(64, 64);
+        BufferedImage local = image(64, 64);
+        for (int y = 0; y < 40; y++) {
+            for (int x = 0; x < 40; x++) {
+                ref.setRGB(x, y, 0xff336699);
+                local.setRGB(x, y, 0xff3366aa); // per-pixel dithering delta beyond the color tolerance
+            }
+        }
+        assertTrue(PixelInfo.addsNewPixels(write(local, "a.png"), write(ref, "b.png")));
+        assertFalse(PixelInfo.addsNewPixelsStrict(write(local, "a.png"), write(ref, "b.png")));
+
+        local.setRGB(50, 50, 0xffaa0000); // genuine new exploration still uploads in strict mode
+        assertTrue(PixelInfo.addsNewPixelsStrict(write(local, "a.png"), write(ref, "b.png")));
+    }
+
+    @Test
+    public void strictModeStillRejectsNetLoss() throws Exception {
+        BufferedImage ref = image(64, 64);
+        BufferedImage local = image(64, 64);
+        for (int y = 0; y < 40; y++) {
+            for (int x = 0; x < 40; x++) {
+                ref.setRGB(x, y, 0xff336699);
+            }
+        }
+        for (int y = 0; y < 10; y++) {
+            for (int x = 0; x < 40; x++) {
+                local.setRGB(x, y, 0xff336699);
+            }
+        }
+        local.setRGB(50, 50, 0xffaa0000);
+        assertFalse(PixelInfo.addsNewPixelsStrict(write(local, "a.png"), write(ref, "b.png")));
+    }
+
+    @Test
     public void unreadableImageCountsAsNew() throws Exception {
         BufferedImage ref = image(16, 16);
         ref.setRGB(1, 1, 0xffffffff);
