@@ -109,8 +109,6 @@ public class ClientSyncManager {
     private int downloaded;
     private int totalToUpload;
     private int uploaded;
-    /** Watch-phase uploads since join; drives the periodic chat notice. */
-    private int watchUploaded;
     private long lastProgressChat;
     private long lastScanMillis;
     private boolean announcedComplete;
@@ -466,13 +464,7 @@ public class ClientSyncManager {
         }
         if (ack.code == 0 || ack.code == 1) {
             uploaded++;
-            JourneySync.LOG.info("Uploaded tile {} ({} bytes)", relPath, data.length);
-            if (phase == Phase.WATCHING) {
-                watchUploaded++;
-                if (watchUploaded == 1 || watchUploaded % 10 == 0) {
-                    chatQueue.offer("journeysync.chat.watch_upload");
-                }
-            }
+            JourneySync.LOG.debug("Uploaded tile {} ({} bytes)", relPath, data.length);
             noteLocalTile(relPath, sha1, file.lastModified(), data.length);
             state.syncedTiles.put(relPath, new ClientState.TileState(sha1, file.lastModified(), data.length));
             saveStateQuietly();
@@ -617,7 +609,9 @@ public class ClientSyncManager {
             return; // server already has this content
         }
         if (!uploadSettler.disabled() && !uploadSettler.observe(relPath, mtime, size, System.currentTimeMillis())) {
-            JourneySync.LOG.debug("Tile still settling, upload deferred: {}", relPath);
+            if (Config.logDebug) {
+                JourneySync.LOG.debug("Tile still settling, upload deferred: {}", relPath);
+            }
             return; // file still settling
         }
         if (!uploadQueue.contains(relPath)) {
@@ -755,7 +749,6 @@ public class ClientSyncManager {
         downloaded = 0;
         totalToUpload = uploadQueue.size();
         uploaded = 0;
-        watchUploaded = 0;
         lastProgressChat = System.currentTimeMillis();
 
         JourneySync.LOG.info(
@@ -919,8 +912,6 @@ public class ClientSyncManager {
                 } else if ("journeysync.chat.sync_progress".equals(chatKey)) {
                     mc.thePlayer.addChatMessage(
                         new ChatComponentTranslation(chatKey, downloaded, totalToDownload, uploaded, totalToUpload));
-                } else if ("journeysync.chat.watch_upload".equals(chatKey)) {
-                    mc.thePlayer.addChatMessage(new ChatComponentTranslation(chatKey, watchUploaded));
                 } else {
                     mc.thePlayer.addChatMessage(new ChatComponentTranslation(chatKey));
                 }
