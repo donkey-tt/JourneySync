@@ -551,6 +551,7 @@ public class ClientSyncManager {
     /** Incremental scan while watching: only re-hash files whose mtime/size changed. */
     private void incrementalScan() {
         scanTiles(false);
+        reconcileWithServer();
         scanWaypoints();
         lastScanMillis = System.currentTimeMillis();
     }
@@ -910,6 +911,35 @@ public class ClientSyncManager {
         }
         if (!uploadQueue.contains(relPath)) {
             uploadQueue.add(relPath);
+        }
+    }
+
+    /**
+     * Backstop for tiles whose drift the stat-based scan somehow missed: if the disk hash no
+     * longer matches the server's entry, yet the last hash we synced IS the server's entry, the
+     * local file silently fell behind (JourneyMap overwrote it without a visible stat change).
+     * A strictly smaller file cannot be pending new exploration, so restoring is safe; tiles we
+     * genuinely modified are larger than our last sync and are left for the upload path.
+     */
+    private void reconcileWithServer() {
+        if (serverManifest == null || !Config.downloadEnabled || jmTiles == null) {
+            return;
+        }
+        for (Map.Entry<String, com.donkeytt.journeysync.data.TileEntry> e : serverManifest.tiles.entrySet()) {
+            String relPath = e.getKey();
+            String local = localSha1.get(relPath);
+            if (local == null || local.equals(e.getValue().sha1)) {
+                continue;
+            }
+            ClientState.TileState recorded = state.syncedTiles.get(relPath);
+            if (recorded == null || !recorded.sha1.equals(e.getValue().sha1)) {
+                continue; // we diverged from the server; the upload path owns this tile
+            }
+            Long size = localSize.get(relPath);
+            if (size != null && size.longValue() >= recorded.size) {
+                continue; // not smaller than what we synced; not a silent regression
+            }
+            enqueueRestore(relPath);
         }
     }
 
