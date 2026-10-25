@@ -77,6 +77,7 @@ public class ClientSyncManager {
     private Manifest serverManifest;
     private ClientState state;
     private File stateFile;
+    private File shadowDir;
     private File jmDir;
     private TileFiles jmTiles;
     private final Map<String, String> localSha1 = new ConcurrentHashMap<String, String>();
@@ -103,6 +104,12 @@ public class ClientSyncManager {
 
     /** Debounces watch-phase uploads until a drifting tile's file stat has settled. */
     private UploadSettler uploadSettler = new UploadSettler(0);
+
+    /** relPath -> epoch millis before which cosmetic re-uploads of that tile are skipped. */
+    private final Map<String, Long> uploadQuietUntil = new HashMap<String, Long>();
+
+    /** relPath -> epoch millis before which another regression-restore of that tile is allowed. */
+    private final Map<String, Long> restoreQuietUntil = new HashMap<String, Long>();
 
     // progress
     private int totalToDownload;
@@ -138,6 +145,8 @@ public class ClientSyncManager {
         pendingWaypointBlob = null;
         jmDir = null;
         jmTiles = null;
+        uploadQuietUntil.clear();
+        restoreQuietUntil.clear();
 
         serverId = computeServerId();
         helloSent = false;
@@ -145,6 +154,7 @@ public class ClientSyncManager {
             new File(Minecraft.getMinecraft().mcDataDir, "config/journeysync"),
             "state-" + serverId + ".json");
         state = ClientState.load(stateFile);
+        shadowDir = new File(new File(Minecraft.getMinecraft().mcDataDir, "config/journeysync"), "shadow/" + serverId);
 
         int effectiveLimit = Config.rateLimitKBps > 0 ? Config.rateLimitKBps : serverRateLimitKBps;
         rateLimiter = new RateLimiter(effectiveLimit > 0 ? effectiveLimit * 1024L : 0);
@@ -300,6 +310,7 @@ public class ClientSyncManager {
             }
             byte[] data = transfer.getData();
             jmTiles.writeAtomic(key, data);
+            writeShadow(key.relPath(), data);
             String sha1 = Hashing.sha1Hex(data);
             noteLocalTile(key.relPath(), sha1, System.currentTimeMillis(), data.length);
             state.syncedTiles
@@ -370,6 +381,7 @@ public class ClientSyncManager {
             TileKey key = TileKey.parse(relPath);
             byte[] data = transfer.getData();
             jmTiles.writeAtomic(key, data);
+            writeShadow(relPath, data);
             String sha1 = Hashing.sha1Hex(data);
             long now = System.currentTimeMillis();
             noteLocalTile(relPath, sha1, now, data.length);
@@ -422,6 +434,32 @@ public class ClientSyncManager {
                 uploadSettler.clear(relPath);
                 return;
             }
+            if (isLocalRegression(relPath, data.length)) {
+                // Our render turned out less complete than a version the server or we ourselves
+                // already hold (late-arriving region data); uploading would regress the shared
+                // map. Not a failure - restore the known-good version locally.
+                noteLocalTile(relPath, sha1, file.lastModified(), data.length);
+                uploadSettler.clear(relPath);
+                enqueueRestore(relPath);
+                JourneySync.LOG.debug("Aborting suspected regression upload: {}", relPath);
+                return;
+            }
+            if (addsNoNewPixels(relPath, data)) {
+                // Stale re-render from incomplete region data: a pixel-level subset of the
+                // server's version. Uploading would clobber newer shared content.
+                noteLocalTile(relPath, sha1, file.lastModified(), data.length);
+                uploadSettler.clear(relPath);
+                enqueueRestore(relPath);
+                JourneySync.LOG.debug("Aborting no-new-pixel upload: {}", relPath);
+                return;
+            }
+        }
+        if (uploadThrottled(relPath, data.length)) {
+            // Cosmetic re-render within the per-tile cooldown; drop quietly.
+            noteLocalTile(relPath, sha1, file.lastModified(), data.length);
+            uploadSettler.clear(relPath);
+            JourneySync.LOG.debug("Upload throttled within cooldown: {}", relPath);
+            return;
         }
 
         int transferId = nextClientTransferId();
@@ -465,6 +503,9 @@ public class ClientSyncManager {
         if (ack.code == 0 || ack.code == 1) {
             uploaded++;
             JourneySync.LOG.debug("Uploaded tile {} ({} bytes)", relPath, data.length);
+            if (Config.tileUploadCooldownSeconds > 0) {
+                uploadQuietUntil.put(relPath, System.currentTimeMillis() + Config.tileUploadCooldownSeconds * 1000L);
+            }
             noteLocalTile(relPath, sha1, file.lastModified(), data.length);
             state.syncedTiles.put(relPath, new ClientState.TileState(sha1, file.lastModified(), data.length));
             saveStateQuietly();
@@ -535,6 +576,10 @@ public class ClientSyncManager {
         localSize.keySet()
             .retainAll(seen);
         uploadSettler.retainAll(seen);
+        uploadQuietUntil.keySet()
+            .retainAll(seen);
+        restoreQuietUntil.keySet()
+            .retainAll(seen);
     }
 
     private void scanTilesIn(File dir, String prefix, Set<String> seen, boolean full) {
@@ -608,6 +653,22 @@ public class ClientSyncManager {
             uploadSettler.clear(relPath);
             return; // server already has this content
         }
+        if (isLocalRegression(relPath, size)) {
+            uploadSettler.clear(relPath);
+            enqueueRestore(relPath);
+            JourneySync.LOG.debug("Skipping regression upload: {}", relPath);
+            return; // incomplete local re-render; never clobber a fuller known version
+        }
+        if (addsNoNewPixels(relPath)) {
+            uploadSettler.clear(relPath);
+            enqueueRestore(relPath);
+            JourneySync.LOG.debug("Skipping stale re-render upload (no new pixels): {}", relPath);
+            return; // subset of the server's version; restore it instead of clobbering
+        }
+        if (uploadThrottled(relPath, size)) {
+            uploadSettler.clear(relPath);
+            return; // cosmetic re-render within the per-tile cooldown
+        }
         if (!uploadSettler.disabled() && !uploadSettler.observe(relPath, mtime, size, System.currentTimeMillis())) {
             if (Config.logDebug) {
                 JourneySync.LOG.debug("Tile still settling, upload deferred: {}", relPath);
@@ -617,6 +678,183 @@ public class ClientSyncManager {
         if (!uploadQueue.contains(relPath)) {
             uploadQueue.add(relPath);
         }
+    }
+
+    /**
+     * Whether the candidate render regresses against any fuller version we know: the server's
+     * current entry or our own last-synced state. Comparing only against the server lets a client
+     * upload a partial render after its own fuller version was clobbered, which restarts the
+     * ping-pong; comparing against both baselines makes regressions die on every client.
+     */
+    private boolean isLocalRegression(String relPath, long size) {
+        com.donkeytt.journeysync.data.TileEntry serverEntry = serverManifest.tiles.get(relPath);
+        if (serverEntry != null && com.donkeytt.journeysync.data.Manifest.isRegression(serverEntry.size, size)) {
+            return true;
+        }
+        ClientState.TileState recorded = state.syncedTiles.get(relPath);
+        return recorded != null && com.donkeytt.journeysync.data.Manifest.isRegression(recorded.size, size);
+    }
+
+    /**
+     * Re-download a tile whose local file regressed below a known fuller version. JourneyMap
+     * clobbers synced tiles with partial re-renders whenever its region cache is incomplete (our
+     * cache clears make it worse); without this, the local view silently rots even though the
+     * server stays correct. Rate-limited so a persistent JM re-render fight costs at most one
+     * download per minute per tile.
+     */
+    private void enqueueRestore(String relPath) {
+        if (!Config.downloadEnabled || serverManifest == null || !serverManifest.tiles.containsKey(relPath)) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        Long until = restoreQuietUntil.get(relPath);
+        if (until != null && now < until.longValue()) {
+            return;
+        }
+        restoreQuietUntil.put(relPath, now + 60_000);
+        if (!downloadQueue.contains(relPath)) {
+            downloadQueue.add(relPath);
+            JourneySync.LOG.debug("Local tile regressed; restoring from server: {}", relPath);
+        }
+    }
+
+    // ------------------------------------------------------------------ shadow copies
+
+    private File shadowFile(String relPath) {
+        return new File(shadowDir, relPath);
+    }
+
+    /** Server-authoritative copy of a tile, used for pixel-level "does this render add anything" checks. */
+    private void writeShadow(String relPath, byte[] data) {
+        File target = shadowFile(relPath);
+        File parent = target.getParentFile();
+        if (parent == null) {
+            return;
+        }
+        parent.mkdirs();
+        try {
+            File tmp = new File(parent, target.getName() + ".tmp");
+            java.nio.file.Files.write(tmp.toPath(), data);
+            java.nio.file.Files.move(tmp.toPath(), target.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+        } catch (Exception e) {
+            JourneySync.LOG.debug("Failed writing shadow tile {}", relPath, e);
+        }
+    }
+
+    /**
+     * Seed the shadow store from tiles that already match the server byte-for-byte, so the
+     * pixel-level guard also covers content synced before the shadow existed, and drop shadows
+     * for tiles the server no longer tracks.
+     */
+    private void backfillShadows() {
+        if (shadowDir == null || serverManifest == null || jmTiles == null) {
+            return;
+        }
+        Set<String> tracked = serverManifest.tiles.keySet();
+        pruneShadowDir(shadowDir, "", tracked);
+        for (Map.Entry<String, com.donkeytt.journeysync.data.TileEntry> e : serverManifest.tiles.entrySet()) {
+            String relPath = e.getKey();
+            if (shadowFile(relPath).isFile()) {
+                continue;
+            }
+            String local = localSha1.get(relPath);
+            if (local == null || !local.equals(e.getValue().sha1)) {
+                continue;
+            }
+            try {
+                TileKey key = TileKey.parse(relPath);
+                File src = key == null ? null : jmTiles.resolve(key);
+                if (src != null && src.isFile()) {
+                    writeShadow(relPath, java.nio.file.Files.readAllBytes(src.toPath()));
+                }
+            } catch (Exception ex) {
+                JourneySync.LOG.debug("Failed backfilling shadow {}", relPath, ex);
+            }
+        }
+    }
+
+    private void pruneShadowDir(File dir, String prefix, Set<String> tracked) {
+        File[] files = dir.listFiles();
+        if (files == null) {
+            return;
+        }
+        for (File f : files) {
+            String rel = prefix.isEmpty() ? f.getName() : prefix + "/" + f.getName();
+            if (f.isDirectory()) {
+                pruneShadowDir(f, rel, tracked);
+                String[] remaining = f.list();
+                if (remaining != null && remaining.length == 0) {
+                    f.delete();
+                }
+            } else if (!tracked.contains(rel)) {
+                f.delete();
+            }
+        }
+    }
+
+    /**
+     * Whether the local render adds no pixel information beyond the server-authoritative shadow.
+     * JourneyMap re-renders tiles from stale in-memory region data whenever its cache is
+     * incomplete; the result is a strict subset of the server's version that would clobber newer
+     * shared content on upload. Size alone cannot separate that from compression jitter (a 4%
+     * content loss looks like a 4% re-encode), so the decision is pixel-level.
+     */
+    private boolean addsNoNewPixels(String relPath, byte[] localData) {
+        com.donkeytt.journeysync.data.TileEntry entry = serverManifest == null ? null
+            : serverManifest.tiles.get(relPath);
+        if (entry == null) {
+            return false;
+        }
+        File shadow = shadowFile(relPath);
+        if (!shadow.isFile()) {
+            return false;
+        }
+        try {
+            byte[] reference = java.nio.file.Files.readAllBytes(shadow.toPath());
+            if (!Hashing.sha1Hex(reference)
+                .equals(entry.sha1)) {
+                return false; // shadow predates the server's current version; cannot judge
+            }
+            return !PixelInfo.addsNewPixels(localData, reference);
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private boolean addsNoNewPixels(String relPath) {
+        TileKey key = TileKey.parse(relPath);
+        if (key == null) {
+            return false;
+        }
+        File file = jmTiles.resolve(key);
+        if (!file.isFile()) {
+            return false;
+        }
+        try {
+            return addsNoNewPixels(relPath, java.nio.file.Files.readAllBytes(file.toPath()));
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /**
+     * Per-tile upload cooldown. JourneyMap re-renders tiles as world time/lighting shifts, and each
+     * render differs by a few bytes - indistinguishable from real new content by hash alone.
+     * Returns true while the tile is in its cooldown window and the candidate is not significantly
+     * larger than what we last synced (i.e. cosmetic jitter, not new exploration).
+     */
+    private boolean uploadThrottled(String relPath, long size) {
+        Long until = uploadQuietUntil.get(relPath);
+        if (until == null) {
+            return false;
+        }
+        if (System.currentTimeMillis() >= until.longValue()) {
+            uploadQuietUntil.remove(relPath);
+            return false;
+        }
+        ClientState.TileState recorded = state.syncedTiles.get(relPath);
+        long baseline = recorded != null ? recorded.size : 0;
+        return baseline <= 0 || size <= baseline + baseline / 4;
     }
 
     /**
@@ -648,6 +886,27 @@ public class ClientSyncManager {
         if (serverEntry != null && serverEntry.sha1.equals(sha1)) {
             uploadSettler.clear(relPath);
             return; // server already has this content
+        }
+        if (serverEntry != null && com.donkeytt.journeysync.data.Manifest.isRegression(serverEntry.size, size)) {
+            uploadSettler.clear(relPath);
+            JourneySync.LOG
+                .debug("Skipping suspected regression upload: {} ({} < server {})", relPath, size, serverEntry.size);
+            return; // incomplete local re-render; never clobber the fuller server version
+        }
+        if (isLocalRegression(relPath, size)) {
+            uploadSettler.clear(relPath);
+            JourneySync.LOG.debug("Skipping self-regressing upload: {}", relPath);
+            return; // smaller than our own last-synced version; JM will re-render fuller
+        }
+        if (addsNoNewPixels(relPath)) {
+            uploadSettler.clear(relPath);
+            enqueueRestore(relPath);
+            JourneySync.LOG.debug("Skipping stale re-render upload (no new pixels): {}", relPath);
+            return; // subset of the server's version; restore it instead of clobbering
+        }
+        if (uploadThrottled(relPath, size)) {
+            uploadSettler.clear(relPath);
+            return; // cosmetic re-render within the per-tile cooldown
         }
         if (!uploadQueue.contains(relPath)) {
             uploadQueue.add(relPath);
@@ -730,10 +989,26 @@ public class ClientSyncManager {
 
     private void computeDiff() {
         Map<String, String> syncedSha1 = state.syncedSha1Map();
-        Set<String> toDownload = serverManifest.diffDownload(localSha1, syncedSha1);
+        backfillShadows();
+        Set<String> toDownload = serverManifest.diffDownload(localSha1, syncedSha1, localSize);
         Set<String> toUpload;
         if (Config.uploadEnabled) {
-            toUpload = serverManifest.diffUpload(localSha1);
+            toUpload = serverManifest.diffUpload(localSha1, localSize);
+            // Never queue a join-time upload that regresses against a fuller known version.
+            Set<String> pruned = new HashSet<String>();
+            for (String path : toUpload) {
+                Long size = localSize.get(path);
+                if (isLocalRegression(path, size == null ? 0 : size.longValue())) {
+                    JourneySync.LOG.debug("Skipping self-regressing upload at join: {}", path);
+                    continue;
+                }
+                if (addsNoNewPixels(path)) {
+                    JourneySync.LOG.debug("Skipping stale re-render upload at join (no new pixels): {}", path);
+                    continue;
+                }
+                pruned.add(path);
+            }
+            toUpload = pruned;
         } else {
             toUpload = new HashSet<String>();
         }

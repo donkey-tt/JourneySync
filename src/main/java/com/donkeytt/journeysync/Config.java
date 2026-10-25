@@ -26,6 +26,8 @@ public class Config {
     public static int maxTileBytes = 32 * 1024 * 1024;
     /** 0 = upload as soon as a change is detected (no debounce) */
     public static int uploadSettleSeconds = 3;
+    /** 0 = no cooldown between uploads of the same tile */
+    public static int tileUploadCooldownSeconds = 300;
 
     public static void synchronizeConfiguration(File configFile) {
         Configuration configuration = new Configuration(configFile);
@@ -80,6 +82,14 @@ public class Config {
             60,
             "Wait until a changed tile file has stayed unchanged this many seconds before uploading"
                 + " (debounces re-renders while moving; 0 = off)");
+        tileUploadCooldownSeconds = configuration.getInt(
+            "tileUploadCooldownSeconds",
+            CATEGORY_TRANSFER,
+            tileUploadCooldownSeconds,
+            0,
+            3600,
+            "After uploading a tile, wait this many minutes before uploading that tile again unless it"
+                + " grew significantly (suppresses cosmetic re-render jitter; 0 = off)");
 
         if (configuration.hasChanged()) {
             configuration.save();
