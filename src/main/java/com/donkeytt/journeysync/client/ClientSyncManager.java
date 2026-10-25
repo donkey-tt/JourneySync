@@ -385,6 +385,7 @@ public class ClientSyncManager {
             sha1 = Hashing.sha1Hex(data);
         } catch (Exception e) {
             JourneySync.LOG.error("Failed reading local tile {}", relPath, e);
+            failTile(relPath);
             return;
         }
 
@@ -433,6 +434,7 @@ public class ClientSyncManager {
 
         if (ack == null) {
             JourneySync.LOG.warn("Upload timed out: {}", relPath);
+            failTile(relPath);
             return;
         }
         if (ack.code == 0 || ack.code == 1) {
@@ -442,6 +444,7 @@ public class ClientSyncManager {
             saveStateQuietly();
         } else {
             JourneySync.LOG.warn("Upload rejected by server (code {}): {}", ack.code, relPath);
+            failTile(relPath);
         }
     }
 
@@ -543,9 +546,34 @@ public class ClientSyncManager {
             try {
                 String sha1 = Hashing.sha1Hex(f);
                 noteLocalTile(relPath, sha1, mtime, size);
+                maybeEnqueueUpload(relPath, recorded, sha1);
             } catch (Exception e) {
                 JourneySync.LOG.error("Failed hashing {}", f, e);
             }
+        }
+    }
+
+    /**
+     * Watch-phase incremental upload: a tile whose content drifted from what we last synced (new
+     * exploration or a JM re-render) goes onto the upload queue, unless the server already holds
+     * this exact content.
+     */
+    private void maybeEnqueueUpload(String relPath, ClientState.TileState recorded, String sha1) {
+        if (!Config.uploadEnabled || serverManifest == null) {
+            return;
+        }
+        if (recorded != null && recorded.sha1.equals(sha1)) {
+            return; // unchanged since our last sync (stat drift only)
+        }
+        if (failedTiles.contains(relPath)) {
+            return; // persistently failing; retried on next join
+        }
+        com.donkeytt.journeysync.data.TileEntry serverEntry = serverManifest.tiles.get(relPath);
+        if (serverEntry != null && serverEntry.sha1.equals(sha1)) {
+            return; // server already has this content
+        }
+        if (!uploadQueue.contains(relPath)) {
+            uploadQueue.add(relPath);
         }
     }
 
