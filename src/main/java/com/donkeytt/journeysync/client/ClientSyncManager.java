@@ -181,8 +181,8 @@ public class ClientSyncManager {
         state = ClientState.load(stateFile);
         shadowDir = new File(new File(Minecraft.getMinecraft().mcDataDir, "config/journeysync"), "shadow/" + serverId);
 
-        int effectiveLimit = Config.rateLimitKBps > 0 ? Config.rateLimitKBps : serverRateLimitKBps;
-        rateLimiter = new RateLimiter(effectiveLimit > 0 ? effectiveLimit * 1024L : 0);
+        // The rate limiter is built in onHelloAck, once the server's effective config is known;
+        // until then (and after a protocol-mismatch disconnect) no transfer can start anyway.
         uploadSettler = new UploadSettler(Config.uploadSettleSeconds * 1000L);
 
         startWorker();
@@ -347,6 +347,7 @@ public class ClientSyncManager {
             }
             PacketHandler.wrapper.sendToServer(new TileAckPacket(transfer.transferId, true));
             saveStateQuietly();
+            JourneySync.LOG.debug("Applied pushed tile {} ({} bytes)", transfer.relPath, data.length);
         } catch (Exception e) {
             JourneySync.LOG.error("Failed writing pushed tile {}", transfer.relPath, e);
         }
@@ -422,6 +423,7 @@ public class ClientSyncManager {
             downloaded++;
             saveStateQuietly();
             PacketHandler.wrapper.sendToServer(new TileAckPacket(transfer.transferId, true));
+            JourneySync.LOG.debug("Applied downloaded tile {} ({} bytes)", relPath, data.length);
         } catch (Exception e) {
             JourneySync.LOG.error("Failed writing downloaded tile {}", relPath, e);
             failTile(relPath);
@@ -590,7 +592,7 @@ public class ClientSyncManager {
 
     /** Full scan: hash all tiles, reusing recorded hashes for unchanged files. */
     private void scanLocal() {
-        scanTiles(true);
+        scanTiles();
         scanWaypoints();
         lastScanMillis = System.currentTimeMillis();
     }
@@ -598,13 +600,13 @@ public class ClientSyncManager {
     /** Incremental scan while watching: only re-hash files whose mtime/size changed. */
     private void incrementalScan() {
         drainWatchEvents();
-        scanTiles(false);
+        scanTiles();
         reconcileWithServer();
         scanWaypoints();
         lastScanMillis = System.currentTimeMillis();
     }
 
-    private void scanTiles(boolean full) {
+    private void scanTiles() {
         File[] dims = jmDir.listFiles();
         if (dims == null) {
             return;
@@ -615,7 +617,7 @@ public class ClientSyncManager {
                 .startsWith("DIM")) {
                 continue;
             }
-            scanTilesIn(dimDir, dimDir.getName(), seen, full);
+            scanTilesIn(dimDir, dimDir.getName(), seen);
         }
         // Reconcile deletions: drop vanished tiles from local maps.
         localSha1.keySet()
@@ -631,14 +633,14 @@ public class ClientSyncManager {
             .retainAll(seen);
     }
 
-    private void scanTilesIn(File dir, String prefix, Set<String> seen, boolean full) {
+    private void scanTilesIn(File dir, String prefix, Set<String> seen) {
         File[] files = dir.listFiles();
         if (files == null) {
             return;
         }
         for (File f : files) {
             if (f.isDirectory()) {
-                scanTilesIn(f, prefix + "/" + f.getName(), seen, full);
+                scanTilesIn(f, prefix + "/" + f.getName(), seen);
                 continue;
             }
             String name = f.getName();
@@ -680,7 +682,7 @@ public class ClientSyncManager {
         try {
             String sha1 = Hashing.sha1Hex(f);
             noteLocalTile(relPath, sha1, mtime, size);
-            maybeEnqueueUpload(relPath, recorded, sha1, mtime, size);
+            maybeEnqueueUpload(relPath, sha1, mtime, size);
         } catch (Exception e) {
             JourneySync.LOG.error("Failed hashing {}", f, e);
         }
@@ -804,18 +806,31 @@ public class ClientSyncManager {
 
     /**
      * Feed queued watch events through the same per-file guard chain as the periodic scan.
-     * Files younger than the write grace period are skipped: a partial write must never be
-     * hashed into the local record or judged by the pixel guards (the next event or the
-     * periodic scan sees the completed file).
+     * Files younger than the write grace period are re-queued instead of dropped: a partial
+     * write must never be hashed into the local record or judged by the pixel guards, and the
+     * re-queue lets the next worker tick (~100ms later) see the completed file long before the
+     * periodic-scan fallback would.
      */
     private void drainWatchEvents() {
         long now = System.currentTimeMillis();
+        List<String> young = null;
         String relPath;
         while ((relPath = watchQueue.poll()) != null) {
             File f = new File(jmDir, relPath);
-            if (f.isFile() && now - f.lastModified() > 500) {
-                processTileFile(f, relPath);
+            if (!f.isFile()) {
+                continue;
             }
+            if (now - f.lastModified() <= 500) {
+                if (young == null) {
+                    young = new ArrayList<String>(2);
+                }
+                young.add(relPath);
+                continue;
+            }
+            processTileFile(f, relPath);
+        }
+        if (young != null) {
+            watchQueue.addAll(young);
         }
     }
 
@@ -826,38 +841,12 @@ public class ClientSyncManager {
      * unchanged file stat for the settle period before it is queued, so re-renders while moving
      * collapse into a single upload of the converged tile.
      */
-    private void maybeEnqueueUpload(String relPath, ClientState.TileState recorded, String sha1, long mtime,
-        long size) {
+    private void maybeEnqueueUpload(String relPath, String sha1, long mtime, long size) {
         if (!Config.uploadEnabled || serverManifest == null) {
             return;
         }
-        if (recorded != null && recorded.sha1.equals(sha1)) {
-            uploadSettler.clear(relPath);
-            return; // unchanged since our last sync (stat drift only)
-        }
-        if (failedTiles.contains(relPath)) {
-            return; // persistently failing; retried on next join
-        }
-        com.donkeytt.journeysync.data.TileEntry serverEntry = serverManifest.tiles.get(relPath);
-        if (serverEntry != null && serverEntry.sha1.equals(sha1)) {
-            uploadSettler.clear(relPath);
-            return; // server already has this content
-        }
-        if (isLocalRegression(relPath, size)) {
-            uploadSettler.clear(relPath);
-            enqueueRestore(relPath);
-            JourneySync.LOG.debug("Skipping regression upload: {}", relPath);
-            return; // incomplete local re-render; never clobber a fuller known version
-        }
-        if (addsNoNewPixels(relPath)) {
-            uploadSettler.clear(relPath);
-            enqueueRestore(relPath);
-            JourneySync.LOG.debug("Skipping stale re-render upload (no new pixels): {}", relPath);
-            return; // subset of the server's version; restore it instead of clobbering
-        }
-        if (uploadThrottled(relPath, size)) {
-            uploadSettler.clear(relPath);
-            return; // cosmetic re-render within the per-tile cooldown
+        if (!passesUploadGuards(relPath, sha1, size)) {
+            return;
         }
         if (!uploadSettler.disabled() && !uploadSettler.observe(relPath, mtime, size, System.currentTimeMillis())) {
             if (Config.logDebug) {
@@ -868,6 +857,45 @@ public class ClientSyncManager {
         if (!uploadQueue.contains(relPath)) {
             uploadQueue.add(relPath);
         }
+    }
+
+    /**
+     * The shared upload guard chain used by every enqueue path (fresh hash or settled re-check):
+     * our own sync record, the server's entry, size regression, the pixel-level "adds nothing"
+     * check, and the per-tile cooldown. Returns false when the tile must not upload; each rejection
+     * clears the settle tracker, and stale re-renders additionally schedule a restore.
+     */
+    private boolean passesUploadGuards(String relPath, String sha1, long size) {
+        if (failedTiles.contains(relPath)) {
+            uploadSettler.clear(relPath);
+            return false; // persistently failing; retried on next join
+        }
+        ClientState.TileState recorded = state.syncedTiles.get(relPath);
+        if (recorded != null && recorded.sha1.equals(sha1)) {
+            uploadSettler.clear(relPath);
+            return false; // unchanged since our last sync (stat drift only)
+        }
+        com.donkeytt.journeysync.data.TileEntry serverEntry = serverManifest.tiles.get(relPath);
+        if (serverEntry != null && serverEntry.sha1.equals(sha1)) {
+            uploadSettler.clear(relPath);
+            return false; // server already has this content
+        }
+        if (isLocalRegression(relPath, size)) {
+            uploadSettler.clear(relPath);
+            JourneySync.LOG.debug("Skipping regression upload: {}", relPath);
+            return false; // incomplete local re-render; never clobber a fuller known version
+        }
+        if (addsNoNewPixels(relPath)) {
+            uploadSettler.clear(relPath);
+            enqueueRestore(relPath);
+            JourneySync.LOG.debug("Skipping stale re-render upload (no new pixels): {}", relPath);
+            return false; // subset of the server's version; restore it instead of clobbering
+        }
+        if (uploadThrottled(relPath, size)) {
+            uploadSettler.clear(relPath);
+            return false; // cosmetic re-render within the per-tile cooldown
+        }
+        return true;
     }
 
     /**
@@ -1079,44 +1107,12 @@ public class ClientSyncManager {
         if (!uploadSettler.fireIfSettled(relPath, mtime, size, System.currentTimeMillis())) {
             return; // not tracked, not settled yet, or already fired
         }
-        if (failedTiles.contains(relPath)) {
-            uploadSettler.clear(relPath);
-            return; // persistently failing; retried on next join
-        }
         String sha1 = localSha1.get(relPath);
         if (sha1 == null) {
             return;
         }
-        ClientState.TileState recorded = state.syncedTiles.get(relPath);
-        if (recorded != null && recorded.sha1.equals(sha1)) {
-            uploadSettler.clear(relPath);
-            return; // content matches our last sync
-        }
-        com.donkeytt.journeysync.data.TileEntry serverEntry = serverManifest.tiles.get(relPath);
-        if (serverEntry != null && serverEntry.sha1.equals(sha1)) {
-            uploadSettler.clear(relPath);
-            return; // server already has this content
-        }
-        if (serverEntry != null && com.donkeytt.journeysync.data.Manifest.isRegression(serverEntry.size, size)) {
-            uploadSettler.clear(relPath);
-            JourneySync.LOG
-                .debug("Skipping suspected regression upload: {} ({} < server {})", relPath, size, serverEntry.size);
-            return; // incomplete local re-render; never clobber the fuller server version
-        }
-        if (isLocalRegression(relPath, size)) {
-            uploadSettler.clear(relPath);
-            JourneySync.LOG.debug("Skipping self-regressing upload: {}", relPath);
-            return; // smaller than our own last-synced version; JM will re-render fuller
-        }
-        if (addsNoNewPixels(relPath)) {
-            uploadSettler.clear(relPath);
-            enqueueRestore(relPath);
-            JourneySync.LOG.debug("Skipping stale re-render upload (no new pixels): {}", relPath);
-            return; // subset of the server's version; restore it instead of clobbering
-        }
-        if (uploadThrottled(relPath, size)) {
-            uploadSettler.clear(relPath);
-            return; // cosmetic re-render within the per-tile cooldown
+        if (!passesUploadGuards(relPath, sha1, size)) {
+            return;
         }
         if (!uploadQueue.contains(relPath)) {
             uploadQueue.add(relPath);
@@ -1375,7 +1371,6 @@ public class ClientSyncManager {
 
     private static class Stored {
 
-        long epoch;
         List<WaypointRecord> records;
     }
 
@@ -1473,17 +1468,9 @@ public class ClientSyncManager {
                 totalToUpload);
     }
 
-    public boolean isPaused() {
-        return paused;
-    }
-
     public void setPaused(boolean value) {
         this.paused = value;
         chatQueue.offer(value ? "journeysync.chat.paused" : "journeysync.chat.resumed");
-    }
-
-    public boolean isActive() {
-        return phase != Phase.DISCONNECTED;
     }
 
     // ------------------------------------------------------------------ helpers
