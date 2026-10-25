@@ -24,6 +24,8 @@ public class Config {
     public static int scanIntervalSeconds = 5;
     public static int chunkSizeBytes = 24 * 1024;
     public static int maxTileBytes = 32 * 1024 * 1024;
+    /** 0 = upload as soon as a change is detected (no debounce) */
+    public static int uploadSettleSeconds = 3;
 
     public static void synchronizeConfiguration(File configFile) {
         Configuration configuration = new Configuration(configFile);
@@ -70,6 +72,14 @@ public class Config {
             1024 * 1024,
             256 * 1024 * 1024,
             "Sanity limit for a single tile transfer");
+        uploadSettleSeconds = configuration.getInt(
+            "uploadSettleSeconds",
+            CATEGORY_TRANSFER,
+            uploadSettleSeconds,
+            0,
+            60,
+            "Wait until a changed tile file has stayed unchanged this many seconds before uploading"
+                + " (debounces re-renders while moving; 0 = off)");
 
         if (configuration.hasChanged()) {
             configuration.save();

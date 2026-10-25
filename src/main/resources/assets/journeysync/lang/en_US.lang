@@ -1,6 +1,7 @@
 journeysync.chat.sync_start=JourneySync: starting sync (%d tiles to download, %d to upload)
 journeysync.chat.sync_complete=JourneySync: initial sync complete, watching for changes
 journeysync.chat.sync_progress=JourneySync: progress - downloaded %d/%d, uploaded %d/%d
+journeysync.chat.watch_upload=JourneySync: uploaded %d new tile(s) while exploring
 journeysync.chat.paused=JourneySync: sync paused
 journeysync.chat.resumed=JourneySync: sync resumed
 journeysync.chat.status=JourneySync: %s

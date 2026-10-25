@@ -1,6 +1,7 @@
 journeysync.chat.sync_start=JourneySync：开始同步（需下载 %d 个瓦片，上传 %d 个）
 journeysync.chat.sync_complete=JourneySync：初始同步完成，正在监视地图变化
 journeysync.chat.sync_progress=JourneySync：进度 - 已下载 %d/%d，已上传 %d/%d
+journeysync.chat.watch_upload=JourneySync：探索中已上传 %d 个新瓦片
 journeysync.chat.paused=JourneySync：同步已暂停
 journeysync.chat.resumed=JourneySync：同步已恢复
 journeysync.chat.status=JourneySync：%s

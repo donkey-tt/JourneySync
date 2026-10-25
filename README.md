@@ -97,6 +97,7 @@ Sync follows one lifecycle, repeated on every join:
 | `uploadEnabled` / `downloadEnabled` | `true` | Directional toggles |
 | `rateLimitKBps` | `0` | Upload/download throttle (0 = unlimited) |
 | `scanIntervalSeconds` | `5` | How often the local cache is scanned for changes |
+| `uploadSettleSeconds` | `3` | A changed tile is uploaded only after its file has stayed unchanged this long, debouncing re-renders while moving (0 = off) |
 | `logDebug` | `false` | Verbose logging |
 
 ## Building

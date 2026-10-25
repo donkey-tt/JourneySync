@@ -101,11 +101,16 @@ public class ClientSyncManager {
 
     private RateLimiter rateLimiter = new RateLimiter(0);
 
+    /** Debounces watch-phase uploads until a drifting tile's file stat has settled. */
+    private UploadSettler uploadSettler = new UploadSettler(0);
+
     // progress
     private int totalToDownload;
     private int downloaded;
     private int totalToUpload;
     private int uploaded;
+    /** Watch-phase uploads since join; drives the periodic chat notice. */
+    private int watchUploaded;
     private long lastProgressChat;
     private long lastScanMillis;
     private boolean announcedComplete;
@@ -145,6 +150,7 @@ public class ClientSyncManager {
 
         int effectiveLimit = Config.rateLimitKBps > 0 ? Config.rateLimitKBps : serverRateLimitKBps;
         rateLimiter = new RateLimiter(effectiveLimit > 0 ? effectiveLimit * 1024L : 0);
+        uploadSettler = new UploadSettler(Config.uploadSettleSeconds * 1000L);
 
         startWorker();
 
@@ -415,6 +421,7 @@ public class ClientSyncManager {
             if (entry != null && entry.sha1.equals(sha1)) {
                 noteLocalTile(relPath, sha1, file.lastModified(), data.length);
                 state.syncedTiles.put(relPath, new ClientState.TileState(sha1, file.lastModified(), data.length));
+                uploadSettler.clear(relPath);
                 return;
             }
         }
@@ -459,6 +466,13 @@ public class ClientSyncManager {
         }
         if (ack.code == 0 || ack.code == 1) {
             uploaded++;
+            JourneySync.LOG.info("Uploaded tile {} ({} bytes)", relPath, data.length);
+            if (phase == Phase.WATCHING) {
+                watchUploaded++;
+                if (watchUploaded == 1 || watchUploaded % 10 == 0) {
+                    chatQueue.offer("journeysync.chat.watch_upload");
+                }
+            }
             noteLocalTile(relPath, sha1, file.lastModified(), data.length);
             state.syncedTiles.put(relPath, new ClientState.TileState(sha1, file.lastModified(), data.length));
             saveStateQuietly();
@@ -528,6 +542,7 @@ public class ClientSyncManager {
             .retainAll(seen);
         localSize.keySet()
             .retainAll(seen);
+        uploadSettler.retainAll(seen);
     }
 
     private void scanTilesIn(File dir, String prefix, Set<String> seen, boolean full) {
@@ -555,18 +570,22 @@ public class ClientSyncManager {
 
             String known = localSha1.get(relPath);
             if (known != null && localMtime.get(relPath) == mtime && localSize.get(relPath) == size) {
+                // Stat unchanged since the last scan - but a previously deferred tile may now
+                // have stayed stable long enough to upload.
+                maybeEnqueueSettled(relPath, mtime, size);
                 continue; // unchanged
             }
             // Fast path: reuse the recorded synced hash when the file matches the recorded stat.
             ClientState.TileState recorded = state.syncedTiles.get(relPath);
             if (recorded != null && recorded.mtime == mtime && recorded.size == size) {
                 noteLocalTile(relPath, recorded.sha1, mtime, size);
+                uploadSettler.clear(relPath);
                 continue;
             }
             try {
                 String sha1 = Hashing.sha1Hex(f);
                 noteLocalTile(relPath, sha1, mtime, size);
-                maybeEnqueueUpload(relPath, recorded, sha1);
+                maybeEnqueueUpload(relPath, recorded, sha1, mtime, size);
             } catch (Exception e) {
                 JourneySync.LOG.error("Failed hashing {}", f, e);
             }
@@ -576,13 +595,17 @@ public class ClientSyncManager {
     /**
      * Watch-phase incremental upload: a tile whose content drifted from what we last synced (new
      * exploration or a JM re-render) goes onto the upload queue, unless the server already holds
-     * this exact content.
+     * this exact content. When the settle debounce is enabled, the tile must additionally keep an
+     * unchanged file stat for the settle period before it is queued, so re-renders while moving
+     * collapse into a single upload of the converged tile.
      */
-    private void maybeEnqueueUpload(String relPath, ClientState.TileState recorded, String sha1) {
+    private void maybeEnqueueUpload(String relPath, ClientState.TileState recorded, String sha1, long mtime,
+        long size) {
         if (!Config.uploadEnabled || serverManifest == null) {
             return;
         }
         if (recorded != null && recorded.sha1.equals(sha1)) {
+            uploadSettler.clear(relPath);
             return; // unchanged since our last sync (stat drift only)
         }
         if (failedTiles.contains(relPath)) {
@@ -590,6 +613,46 @@ public class ClientSyncManager {
         }
         com.donkeytt.journeysync.data.TileEntry serverEntry = serverManifest.tiles.get(relPath);
         if (serverEntry != null && serverEntry.sha1.equals(sha1)) {
+            uploadSettler.clear(relPath);
+            return; // server already has this content
+        }
+        if (!uploadSettler.disabled() && !uploadSettler.observe(relPath, mtime, size, System.currentTimeMillis())) {
+            JourneySync.LOG.debug("Tile still settling, upload deferred: {}", relPath);
+            return; // file still settling
+        }
+        if (!uploadQueue.contains(relPath)) {
+            uploadQueue.add(relPath);
+        }
+    }
+
+    /**
+     * Stability re-check for tiles whose stat did not change since the last scan: a tile deferred
+     * by the settle debounce uploads once it has stayed stable for the settle period. Guards are
+     * re-validated against the recorded local hash, which still matches the file content here.
+     */
+    private void maybeEnqueueSettled(String relPath, long mtime, long size) {
+        if (!Config.uploadEnabled || serverManifest == null || uploadSettler.disabled()) {
+            return;
+        }
+        if (!uploadSettler.fireIfSettled(relPath, mtime, size, System.currentTimeMillis())) {
+            return; // not tracked, not settled yet, or already fired
+        }
+        if (failedTiles.contains(relPath)) {
+            uploadSettler.clear(relPath);
+            return; // persistently failing; retried on next join
+        }
+        String sha1 = localSha1.get(relPath);
+        if (sha1 == null) {
+            return;
+        }
+        ClientState.TileState recorded = state.syncedTiles.get(relPath);
+        if (recorded != null && recorded.sha1.equals(sha1)) {
+            uploadSettler.clear(relPath);
+            return; // content matches our last sync
+        }
+        com.donkeytt.journeysync.data.TileEntry serverEntry = serverManifest.tiles.get(relPath);
+        if (serverEntry != null && serverEntry.sha1.equals(sha1)) {
+            uploadSettler.clear(relPath);
             return; // server already has this content
         }
         if (!uploadQueue.contains(relPath)) {
@@ -692,6 +755,7 @@ public class ClientSyncManager {
         downloaded = 0;
         totalToUpload = uploadQueue.size();
         uploaded = 0;
+        watchUploaded = 0;
         lastProgressChat = System.currentTimeMillis();
 
         JourneySync.LOG.info(
@@ -855,6 +919,8 @@ public class ClientSyncManager {
                 } else if ("journeysync.chat.sync_progress".equals(chatKey)) {
                     mc.thePlayer.addChatMessage(
                         new ChatComponentTranslation(chatKey, downloaded, totalToDownload, uploaded, totalToUpload));
+                } else if ("journeysync.chat.watch_upload".equals(chatKey)) {
+                    mc.thePlayer.addChatMessage(new ChatComponentTranslation(chatKey, watchUploaded));
                 } else {
                     mc.thePlayer.addChatMessage(new ChatComponentTranslation(chatKey));
                 }
