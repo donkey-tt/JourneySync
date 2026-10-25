@@ -48,6 +48,17 @@ public final class JmBridge {
     private static long lastRegionClear;
     private static long lastWaypointReset;
 
+    // region re-render requests (repair tool: JM only re-renders chunks its task system decides to,
+    // so damage predating the pixel-union pipeline can only be healed by explicitly queueing a
+    // MapRegionTask for the affected region - the same task JM's own "automapping" feature uses)
+    private static boolean remapResolved;
+    private static Object jmClient;
+    private static java.lang.reflect.Field taskControllerField;
+    private static Method jmToggleTask;
+    private static Method isTaskManagerEnabled;
+    private static Class<?> mapRegionTaskManagerClass;
+    private static Method regionCoordFromChunkPos;
+
     private JmBridge() {}
 
     /** Cheap check; full resolution happens lazily on first use. */
@@ -108,6 +119,28 @@ public final class JmBridge {
             tileRefreshResolved = true;
         } catch (Throwable t) {
             JourneySync.LOG.error("JourneyMap targeted tile refresh unavailable; falling back to full cache clears", t);
+        }
+        try {
+            Class<?> jmClientClass = Class.forName("journeymap.client.JourneymapClient");
+            jmClient = jmClientClass.getMethod("getInstance")
+                .invoke(null);
+            jmToggleTask = jmClientClass.getMethod("toggleTask", Class.class, boolean.class, Object.class);
+            // The controller instance is created by JourneymapClient.startMapping() and nulled by
+            // stopMapping() - long after any first resolve() and again on every world change - so
+            // only the Field is resolved here; the instance is read fresh at each use.
+            taskControllerField = jmClientClass.getDeclaredField("multithreadTaskController");
+            taskControllerField.setAccessible(true);
+            Class<?> taskControllerClass = Class.forName("journeymap.client.task.multi.TaskController");
+            isTaskManagerEnabled = taskControllerClass.getMethod("isTaskManagerEnabled", Class.class);
+            Class<?> mapTypeClass = Class.forName("journeymap.client.model.MapType");
+            Class<?> coordClass = Class.forName("journeymap.client.model.RegionCoord");
+            regionCoordFromChunkPos = coordClass
+                .getMethod("fromChunkPos", File.class, mapTypeClass, int.class, int.class);
+            mapRegionTaskManagerClass = Class.forName("journeymap.client.task.multi.MapRegionTask$Manager");
+            remapResolved = true;
+        } catch (Throwable t) {
+            JourneySync.LOG
+                .error("JourneyMap region re-render integration unavailable; the rerender command is disabled", t);
         }
     }
 
@@ -234,6 +267,89 @@ public final class JmBridge {
             if (ConfigDebugOnce.log("waypoints")) {
                 JourneySync.LOG.error("WaypointStore.reset failed", t);
             }
+        }
+    }
+
+    /** Whether the region re-render integration resolved (the repair command needs it). */
+    public static boolean isRegionRemapSupported() {
+        resolve();
+        return remapResolved;
+    }
+
+    /**
+     * Whether the rerender pipeline can actually run right now: the integration resolved and JM's
+     * task controller exists, i.e. mapping has started in the current world. Queued entries must
+     * wait (not drop) while this is false - it flips late after world join and again after every
+     * world change.
+     */
+    public static boolean isRegionRemapReady() {
+        resolve();
+        return remapResolved && taskController() != null;
+    }
+
+    /**
+     * The live multithreadTaskController instance, or null before startMapping()/after
+     * stopMapping(). Read fresh on every call: the instance is recreated per world.
+     */
+    private static Object taskController() {
+        if (taskControllerField == null) {
+            return null;
+        }
+        try {
+            return taskControllerField.get(jmClient);
+        } catch (Throwable t) {
+            if (ConfigDebugOnce.log("remapcontroller")) {
+                JourneySync.LOG.error("Reading JourneymapClient.multithreadTaskController failed", t);
+            }
+            return null;
+        }
+    }
+
+    /**
+     * Whether JM is currently running or has accepted a region remap task. JM ignores a new task
+     * while one is enabled ("Task already enabled"), so callers must wait for the busy flag to
+     * clear before queueing the next region.
+     */
+    public static boolean isRegionTaskBusy() {
+        resolve();
+        if (!remapResolved) {
+            return false;
+        }
+        Object controller = taskController();
+        if (controller == null) {
+            return false;
+        }
+        try {
+            return Boolean.TRUE.equals(isTaskManagerEnabled.invoke(controller, mapRegionTaskManagerClass));
+        } catch (Throwable t) {
+            if (ConfigDebugOnce.log("remapbusy")) {
+                JourneySync.LOG.error("TaskController.isTaskManagerEnabled failed", t);
+            }
+            return false;
+        }
+    }
+
+    /**
+     * Ask JM to re-render the region (32x32 chunks) containing the given chunk, using the same
+     * task its own automapping drives. Only loaded chunks are rendered; the caller is expected to
+     * stand inside the affected area so the render is complete. The rewritten tile file is picked
+     * up by the file watcher and folded into the pixel union like any other render.
+     */
+    public static boolean remapRegion(File worldDir, int dimension, int chunkX, int chunkZ, boolean night) {
+        resolve();
+        if (!remapResolved || worldDir == null || taskController() == null) {
+            return false; // without a controller JM's toggleTask is a silent no-op
+        }
+        try {
+            Object mapType = (night ? mapTypeNight : mapTypeDay).invoke(null, dimension);
+            Object coord = regionCoordFromChunkPos.invoke(null, worldDir, mapType, chunkX, chunkZ);
+            jmToggleTask.invoke(jmClient, mapRegionTaskManagerClass, true, coord);
+            return true;
+        } catch (Throwable t) {
+            if (ConfigDebugOnce.log("remap")) {
+                JourneySync.LOG.error("Region re-render request failed", t);
+            }
+            return false;
         }
     }
 

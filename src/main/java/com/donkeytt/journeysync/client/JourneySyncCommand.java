@@ -8,7 +8,8 @@ import net.minecraft.command.ICommandSender;
 import net.minecraft.util.ChatComponentTranslation;
 
 /**
- * Client-side {@code /journeysync} (alias {@code /jsync}) command: status, pause, resume.
+ * Client-side {@code /journeysync} (alias {@code /jsync}) command: status, pause, resume,
+ * rerender.
  */
 public class JourneySyncCommand extends CommandBase {
 
@@ -25,7 +26,7 @@ public class JourneySyncCommand extends CommandBase {
 
     @Override
     public String getCommandUsage(ICommandSender sender) {
-        return "/journeysync [status|pause|resume]";
+        return "/journeysync [status|pause|resume|rerender]";
     }
 
     @Override
@@ -51,6 +52,13 @@ public class JourneySyncCommand extends CommandBase {
                 break;
             case "resume":
                 manager.setPaused(false);
+                break;
+            case "rerender":
+                if (manager.queueRerender()) {
+                    sender.addChatMessage(new ChatComponentTranslation("journeysync.chat.rerender_queued"));
+                } else {
+                    sender.addChatMessage(new ChatComponentTranslation("journeysync.chat.rerender_unavailable"));
+                }
                 break;
             default:
                 sender.addChatMessage(new ChatComponentTranslation("journeysync.chat.usage", getCommandUsage(sender)));

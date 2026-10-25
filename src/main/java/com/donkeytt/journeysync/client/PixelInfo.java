@@ -77,18 +77,60 @@ public final class PixelInfo {
         }
     }
 
+    /**
+     * Whether the candidate render lost explored coverage relative to the reference (more explored
+     * pixels blanked than gained). Used to detect JourneyMap clobbering a synced tile with an
+     * incomplete re-render so the fuller version can be restored locally. Unreadable images
+     * conservatively count as no loss.
+     */
+    public static boolean hasNetLoss(byte[] candidatePng, byte[] referencePng) {
+        try {
+            return hasNetLoss(
+                ImageIO.read(new ByteArrayInputStream(candidatePng)),
+                ImageIO.read(new ByteArrayInputStream(referencePng)));
+        } catch (IOException e) {
+            return false;
+        }
+    }
+
     static boolean addsNewPixels(BufferedImage local, BufferedImage reference) {
         return addsNewPixels(local, reference, false);
     }
 
     static boolean addsNewPixels(BufferedImage local, BufferedImage reference, boolean strict) {
-        if (local == null || reference == null) {
+        int[] counts = countPixels(local, reference);
+        if (counts == null) {
             return true;
+        }
+        int newPixels = counts[0];
+        int changedPixels = counts[1];
+        int lostPixels = counts[2];
+        if (lostPixels > newPixels + CHANGED_PIXEL_THRESHOLD) {
+            return false; // net loss: a fuller version exists and must not be clobbered
+        }
+        if (strict) {
+            return newPixels > 0;
+        }
+        return newPixels > 0 || changedPixels > CHANGED_PIXEL_THRESHOLD;
+    }
+
+    static boolean hasNetLoss(BufferedImage local, BufferedImage reference) {
+        int[] counts = countPixels(local, reference);
+        if (counts == null) {
+            return false;
+        }
+        return counts[2] > counts[0] + CHANGED_PIXEL_THRESHOLD;
+    }
+
+    /** [newPixels, changedPixels, lostPixels] over the overlapping canvas, or null when incomparable. */
+    private static int[] countPixels(BufferedImage local, BufferedImage reference) {
+        if (local == null || reference == null) {
+            return null;
         }
         int w = Math.min(local.getWidth(), reference.getWidth());
         int h = Math.min(local.getHeight(), reference.getHeight());
         if (w <= 0 || h <= 0) {
-            return true;
+            return null;
         }
         int[] localRgb = local.getRGB(0, 0, w, h, null, 0, w);
         int[] refRgb = reference.getRGB(0, 0, w, h, null, 0, w);
@@ -113,13 +155,7 @@ public final class PixelInfo {
                 changedPixels++;
             }
         }
-        if (lostPixels > newPixels + CHANGED_PIXEL_THRESHOLD) {
-            return false; // net loss: a fuller version exists and must not be clobbered
-        }
-        if (strict) {
-            return newPixels > 0;
-        }
-        return newPixels > 0 || changedPixels > CHANGED_PIXEL_THRESHOLD;
+        return new int[] { newPixels, changedPixels, lostPixels };
     }
 
     private static int colorDiff(int a, int b) {

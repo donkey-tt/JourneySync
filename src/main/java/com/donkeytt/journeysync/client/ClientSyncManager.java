@@ -127,6 +127,21 @@ public class ClientSyncManager {
     private final Map<String, Long> inboundQuietUntil = new HashMap<String, Long>();
     private static final long INBOUND_QUIET_MILLIS = 120_000;
 
+    /**
+     * Per-tile pixel union of every local render seen this session, fed at scan time and consumed
+     * by doUpload as the upload payload. JourneyMap re-renders trail tiles from whatever chunks
+     * happen to be loaded, so any single render can be a subset that overwrites the file; the
+     * cache keeps those dropped pixels alive until an upload ack confirms the server holds them
+     * (the entry is removed on ack). Bounded so a long session cannot grow it without limit.
+     */
+    private final Map<String, byte[]> renderCache = new LinkedHashMap<String, byte[]>() {
+
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<String, byte[]> eldest) {
+            return size() > 64;
+        }
+    };
+
     // progress
     private int totalToDownload;
     private int downloaded;
@@ -147,6 +162,15 @@ public class ClientSyncManager {
     private Thread tileWatcherThread;
     private final BlockingQueue<String> watchQueue = new LinkedBlockingQueue<String>();
     private volatile File watchBaseDir;
+
+    /**
+     * Regions (32x32 chunk squares) JourneyMap should re-render, queued by the rerender command.
+     * Entries are [dimension, minChunkX, minChunkZ, night?1:0]; drained one at a time onto JM's
+     * task system, which ignores a new region task while one is still enabled.
+     */
+    private final Deque<int[]> remapQueue = new ArrayDeque<int[]>();
+    private int remapTick;
+    private static final int REMAP_POLL_TICKS = 10; // ~0.5s between busy-flag polls
 
     private ClientSyncManager() {}
 
@@ -172,6 +196,8 @@ public class ClientSyncManager {
         uploadQuietUntil.clear();
         restoreQuietUntil.clear();
         inboundQuietUntil.clear();
+        renderCache.clear();
+        remapQueue.clear();
 
         serverId = computeServerId();
         helloSent = false;
@@ -337,6 +363,7 @@ public class ClientSyncManager {
             byte[] data = transfer.getData();
             jmTiles.writeAtomic(key, data);
             writeShadow(key.relPath(), data);
+            accumulateRender(key.relPath(), data); // an in-flight union upload must not lose these pixels
             inboundQuietUntil.put(key.relPath(), System.currentTimeMillis() + INBOUND_QUIET_MILLIS);
             String sha1 = Hashing.sha1Hex(data);
             noteLocalTile(key.relPath(), sha1, System.currentTimeMillis(), data.length);
@@ -412,6 +439,7 @@ public class ClientSyncManager {
             byte[] data = transfer.getData();
             jmTiles.writeAtomic(key, data);
             writeShadow(relPath, data);
+            accumulateRender(relPath, data); // an in-flight union upload must not lose these pixels
             inboundQuietUntil.put(relPath, System.currentTimeMillis() + INBOUND_QUIET_MILLIS);
             String sha1 = Hashing.sha1Hex(data);
             long now = System.currentTimeMillis();
@@ -448,49 +476,67 @@ public class ClientSyncManager {
         if (!file.isFile()) {
             return; // vanished; watcher will reconcile
         }
-        byte[] data;
-        String sha1;
+        byte[] current;
         try {
-            data = java.nio.file.Files.readAllBytes(file.toPath());
-            sha1 = Hashing.sha1Hex(data);
+            current = java.nio.file.Files.readAllBytes(file.toPath());
         } catch (Exception e) {
             JourneySync.LOG.error("Failed reading local tile {}", relPath, e);
             failTile(relPath);
             return;
         }
 
-        // Skip when the server already has this content (e.g. pushed back to us).
+        // The payload is the pixel union of every render accumulated for this tile (the
+        // renderCache, fed at scan time) merged with the file as it stands now. A re-render that
+        // dropped pixels once its chunks unloaded does not drop them from the payload, and the
+        // server-side merge is itself a union - this can never regress the shared map.
+        byte[] data = current;
+        byte[] cached = renderCache.get(relPath);
+        if (cached != null) {
+            byte[] merged = com.donkeytt.journeysync.data.PixelMerge.mergePng(cached, current);
+            if (merged != null) {
+                data = merged;
+            }
+        }
+        String sha1 = Hashing.sha1Hex(data);
+
         if (serverManifest != null) {
             com.donkeytt.journeysync.data.TileEntry entry = serverManifest.tiles.get(relPath);
             if (entry != null && entry.sha1.equals(sha1)) {
-                noteLocalTile(relPath, sha1, file.lastModified(), data.length);
-                state.syncedTiles.put(relPath, new ClientState.TileState(sha1, file.lastModified(), data.length));
+                // Server already holds exactly this payload (e.g. it was pushed back to us).
+                noteLocalTile(relPath, Hashing.sha1Hex(current), file.lastModified(), current.length);
+                state.syncedTiles.put(relPath, new ClientState.TileState(entry.sha1, file.lastModified(), entry.size));
                 uploadSettler.clear(relPath);
+                renderCache.remove(relPath); // the server already contains everything we rendered
                 return;
             }
-            if (isLocalRegression(relPath, data.length)) {
-                // Our render turned out less complete than a version the server or we ourselves
-                // already hold (late-arriving region data); uploading would regress the shared
-                // map. Not a failure - restore the known-good version locally.
-                noteLocalTile(relPath, sha1, file.lastModified(), data.length);
-                uploadSettler.clear(relPath);
-                enqueueRestore(relPath);
-                JourneySync.LOG.debug("Aborting suspected regression upload: {}", relPath);
-                return;
-            }
-            if (addsNoNewPixels(relPath, data)) {
-                // Stale re-render from incomplete region data: a pixel-level subset of the
-                // server's version. Uploading would clobber newer shared content.
-                noteLocalTile(relPath, sha1, file.lastModified(), data.length);
-                uploadSettler.clear(relPath);
-                enqueueRestore(relPath);
-                JourneySync.LOG.debug("Aborting no-new-pixel upload: {}", relPath);
-                return;
+            byte[] reference = entry == null ? null : serverReference(relPath);
+            if (reference != null) {
+                boolean adds = isInboundQuiet(relPath) ? PixelInfo.addsNewPixelsStrict(data, reference)
+                    : PixelInfo.addsNewPixels(data, reference);
+                if (!adds) {
+                    // The accumulated union adds nothing over the server's version: everything we
+                    // have rendered is already shared. Adopt the server's entry as our sync point
+                    // and drop the union; the file on disk may still be a rotting subset.
+                    String currentSha1 = Hashing.sha1Hex(current);
+                    noteLocalTile(relPath, currentSha1, file.lastModified(), current.length);
+                    state.syncedTiles
+                        .put(relPath, new ClientState.TileState(entry.sha1, System.currentTimeMillis(), entry.size));
+                    uploadSettler.clear(relPath);
+                    renderCache.remove(relPath);
+                    if (PixelInfo.hasNetLoss(current, reference)) {
+                        enqueueRestore(relPath);
+                        JourneySync.LOG
+                            .debug("Union adds no pixels and local render regressed; restoring: {}", relPath);
+                    } else {
+                        JourneySync.LOG.debug("Skipping upload; union adds no new pixels: {}", relPath);
+                    }
+                    return;
+                }
             }
         }
         if (uploadThrottled(relPath, data.length)) {
             // Cosmetic re-render within the per-tile cooldown; drop quietly.
-            noteLocalTile(relPath, sha1, file.lastModified(), data.length);
+            noteLocalTile(relPath, Hashing.sha1Hex(current), file.lastModified(), current.length);
             uploadSettler.clear(relPath);
             JourneySync.LOG.debug("Upload throttled within cooldown: {}", relPath);
             return;
@@ -540,7 +586,8 @@ public class ClientSyncManager {
             if (Config.tileUploadCooldownSeconds > 0) {
                 uploadQuietUntil.put(relPath, System.currentTimeMillis() + Config.tileUploadCooldownSeconds * 1000L);
             }
-            noteLocalTile(relPath, sha1, file.lastModified(), data.length);
+            renderCache.remove(relPath); // the server now holds everything we had accumulated
+            noteLocalTile(relPath, Hashing.sha1Hex(current), file.lastModified(), current.length);
             com.donkeytt.journeysync.data.TileEntry serverEntry = serverManifest == null ? null
                 : serverManifest.tiles.get(relPath);
             if (ack.code == 1 && serverEntry != null && !serverEntry.sha1.equals(sha1)) {
@@ -548,12 +595,12 @@ public class ClientSyncManager {
                 // of ours with other clients' pixels). Adopt it as our sync point and pull it so
                 // the local disk/display converge to the merged map; otherwise the next scans
                 // would re-upload our subset forever.
-                state.syncedTiles
-                    .put(relPath, new ClientState.TileState(serverEntry.sha1, System.currentTimeMillis(), serverEntry.size));
+                state.syncedTiles.put(
+                    relPath,
+                    new ClientState.TileState(serverEntry.sha1, System.currentTimeMillis(), serverEntry.size));
                 enqueueRestore(relPath);
             } else {
-                state.syncedTiles
-                    .put(relPath, new ClientState.TileState(sha1, file.lastModified(), data.length));
+                state.syncedTiles.put(relPath, new ClientState.TileState(sha1, file.lastModified(), data.length));
                 writeShadow(relPath, data); // our bytes are now the server-side reference for pixel checks
             }
             saveStateQuietly();
@@ -680,8 +727,10 @@ public class ClientSyncManager {
             return;
         }
         try {
-            String sha1 = Hashing.sha1Hex(f);
+            byte[] data = java.nio.file.Files.readAllBytes(f.toPath());
+            String sha1 = Hashing.sha1Hex(data);
             noteLocalTile(relPath, sha1, mtime, size);
+            accumulateRender(relPath, data); // capture happens even when the upload is deferred
             maybeEnqueueUpload(relPath, sha1, mtime, size);
         } catch (Exception e) {
             JourneySync.LOG.error("Failed hashing {}", f, e);
@@ -861,9 +910,10 @@ public class ClientSyncManager {
 
     /**
      * The shared upload guard chain used by every enqueue path (fresh hash or settled re-check):
-     * our own sync record, the server's entry, size regression, the pixel-level "adds nothing"
-     * check, and the per-tile cooldown. Returns false when the tile must not upload; each rejection
-     * clears the settle tracker, and stale re-renders additionally schedule a restore.
+     * our own sync record, the server's entry, and the per-tile cooldown. Returns false when the
+     * tile must not upload; each rejection clears the settle tracker. Regressions no longer block
+     * the upload - the payload is the accumulated pixel union, which can only add coverage - they
+     * only schedule a restore so the rotting local file is refreshed for display.
      */
     private boolean passesUploadGuards(String relPath, String sha1, long size) {
         if (failedTiles.contains(relPath)) {
@@ -881,15 +931,7 @@ public class ClientSyncManager {
             return false; // server already has this content
         }
         if (isLocalRegression(relPath, size)) {
-            uploadSettler.clear(relPath);
-            JourneySync.LOG.debug("Skipping regression upload: {}", relPath);
-            return false; // incomplete local re-render; never clobber a fuller known version
-        }
-        if (addsNoNewPixels(relPath)) {
-            uploadSettler.clear(relPath);
-            enqueueRestore(relPath);
-            JourneySync.LOG.debug("Skipping stale re-render upload (no new pixels): {}", relPath);
-            return false; // subset of the server's version; restore it instead of clobbering
+            enqueueRestore(relPath); // the file is rotting; the union upload itself is harmless
         }
         if (uploadThrottled(relPath, size)) {
             uploadSettler.clear(relPath);
@@ -1023,27 +1065,58 @@ public class ClientSyncManager {
      * pixels (real exploration) may upload.
      */
     private boolean addsNoNewPixels(String relPath, byte[] localData) {
+        byte[] reference = serverReference(relPath);
+        if (reference == null) {
+            return false;
+        }
+        if (isInboundQuiet(relPath)) {
+            return !PixelInfo.addsNewPixelsStrict(localData, reference);
+        }
+        return !PixelInfo.addsNewPixels(localData, reference);
+    }
+
+    /**
+     * The server-authoritative shadow bytes for a tile, or null when unavailable or when the
+     * shadow predates the server's current version (and so cannot judge new pixels).
+     */
+    private byte[] serverReference(String relPath) {
         com.donkeytt.journeysync.data.TileEntry entry = serverManifest == null ? null
             : serverManifest.tiles.get(relPath);
         if (entry == null) {
-            return false;
+            return null;
         }
         File shadow = shadowFile(relPath);
         if (!shadow.isFile()) {
-            return false;
+            return null;
         }
         try {
             byte[] reference = java.nio.file.Files.readAllBytes(shadow.toPath());
             if (!Hashing.sha1Hex(reference)
                 .equals(entry.sha1)) {
-                return false; // shadow predates the server's current version; cannot judge
+                return null; // shadow predates the server's current version; cannot judge
             }
-            if (isInboundQuiet(relPath)) {
-                return !PixelInfo.addsNewPixelsStrict(localData, reference);
-            }
-            return !PixelInfo.addsNewPixels(localData, reference);
+            return reference;
         } catch (Exception e) {
-            return false;
+            return null;
+        }
+    }
+
+    /**
+     * Merge a render into the per-tile accumulated pixel union (the renderCache). JourneyMap
+     * re-renders a trail tile from whatever chunks are currently loaded, so any single render can
+     * be a subset that overwrites the file; unioning at scan time decouples capture from
+     * transmission and keeps the dropped pixels alive until an upload ack confirms the server
+     * holds them.
+     */
+    private void accumulateRender(String relPath, byte[] png) {
+        byte[] cached = renderCache.get(relPath);
+        if (cached == null) {
+            renderCache.put(relPath, png);
+            return;
+        }
+        byte[] merged = com.donkeytt.journeysync.data.PixelMerge.mergePng(cached, png);
+        if (merged != null) {
+            renderCache.put(relPath, merged);
         }
     }
 
@@ -1412,6 +1485,7 @@ public class ClientSyncManager {
             needsWaypointReset = false;
             JmBridge.resetWaypoints();
         }
+        drainRemapQueue();
         String chatKey;
         while ((chatKey = chatQueue.poll()) != null) {
             Minecraft mc = Minecraft.getMinecraft();
@@ -1432,6 +1506,42 @@ public class ClientSyncManager {
         if (phase == Phase.TRANSFERRING && now - lastProgressChat > 10_000) {
             lastProgressChat = now;
             chatQueue.offer("journeysync.chat.sync_progress");
+        }
+    }
+
+    /**
+     * Feed queued region re-renders onto JM's task system, one region at a time: enabling a
+     * MapRegionTask while one is already enabled is silently ignored by JM, so the next entry
+     * waits for the busy flag to clear (polled every {@link #REMAP_POLL_TICKS} ticks rather than
+     * every tick to keep the reflective busy check cheap). A request that fails outright drops
+     * its entry - retrying a broken integration would only spam the log.
+     */
+    private void drainRemapQueue() {
+        if (remapQueue.isEmpty()) {
+            return;
+        }
+        if (remapTick > 0) {
+            remapTick--;
+            return;
+        }
+        remapTick = REMAP_POLL_TICKS;
+        if (!JmBridge.isRegionRemapReady()) {
+            return; // JM task controller not up yet (or gone with the world); keep entries queued
+        }
+        if (JmBridge.isRegionTaskBusy()) {
+            return; // still rendering the previous region; retry at the next poll
+        }
+        int[] entry = remapQueue.poll();
+        File worldDir = jmDir != null ? jmDir : JmBridge.getJMWorldDir();
+        if (JmBridge.remapRegion(worldDir, entry[0], entry[1], entry[2], entry[3] == 1)) {
+            JourneySync.LOG.debug(
+                "Region re-render queued: dim {} chunks ({}, {}) {}",
+                entry[0],
+                entry[1],
+                entry[2],
+                entry[3] == 1 ? "night" : "day");
+        } else {
+            JourneySync.LOG.warn("Region re-render request failed; dropping entry ({} left)", remapQueue.size());
         }
     }
 
@@ -1471,6 +1581,30 @@ public class ClientSyncManager {
     public void setPaused(boolean value) {
         this.paused = value;
         chatQueue.offer(value ? "journeysync.chat.paused" : "journeysync.chat.resumed");
+    }
+
+    /**
+     * Queue JM re-renders of the region (32x32 chunks) containing the player, day and night
+     * variants - the repair tool for map damage that predates the pixel-union pipeline. JM only
+     * renders loaded chunks, so the player must stand in the affected area for a complete render;
+     * the rewritten tiles then flow through the file watcher into the normal upload path like any
+     * other render. Returns false when the JM task integration is unavailable or no player
+     * position can be read; nothing is queued.
+     */
+    public boolean queueRerender() {
+        if (!JmBridge.isRegionRemapSupported()) {
+            return false;
+        }
+        Minecraft mc = Minecraft.getMinecraft();
+        if (mc.thePlayer == null) {
+            return false;
+        }
+        int dimension = mc.thePlayer.dimension;
+        int minChunkX = ((int) Math.floor(mc.thePlayer.posX)) >> 4 & ~31;
+        int minChunkZ = ((int) Math.floor(mc.thePlayer.posZ)) >> 4 & ~31;
+        remapQueue.add(new int[] { dimension, minChunkX, minChunkZ, 0 });
+        remapQueue.add(new int[] { dimension, minChunkX, minChunkZ, 1 });
+        return true;
     }
 
     // ------------------------------------------------------------------ helpers

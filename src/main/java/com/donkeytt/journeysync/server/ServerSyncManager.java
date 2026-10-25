@@ -198,9 +198,7 @@ public class ServerSyncManager {
             return;
         }
 
-        manifest.tiles.put(
-            key.relPath(),
-            new TileEntry(sha1, data.length));
+        manifest.tiles.put(key.relPath(), new TileEntry(sha1, data.length));
         dirty = true;
         sendTo(player, new TileUploadAckPacket(transfer.transferId, 0));
 
