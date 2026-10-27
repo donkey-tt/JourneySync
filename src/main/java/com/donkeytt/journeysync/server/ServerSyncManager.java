@@ -19,17 +19,21 @@ import com.donkeytt.journeysync.io.Hashing;
 import com.donkeytt.journeysync.io.TileFiles;
 import com.donkeytt.journeysync.network.IncomingTransfer;
 import com.donkeytt.journeysync.network.PacketHandler;
+import com.donkeytt.journeysync.network.TileChunking;
 import com.donkeytt.journeysync.network.packets.BlobPacket;
 import com.donkeytt.journeysync.network.packets.HelloAckPacket;
 import com.donkeytt.journeysync.network.packets.HelloPacket;
-import com.donkeytt.journeysync.network.packets.TileBeginPacket;
-import com.donkeytt.journeysync.network.packets.TileDataPacket;
-import com.donkeytt.journeysync.network.packets.TileUploadAckPacket;
+import com.donkeytt.journeysync.network.packets.TileChunk;
+import com.donkeytt.journeysync.network.packets.TileTransferAck;
+import com.donkeytt.journeysync.network.packets.TileTransferBegin;
+
+import cpw.mods.fml.common.network.simpleimpl.IMessage;
 
 /**
  * Server-side aggregation point. Owns the on-disk tile store and manifest, receives uploads,
- * serves downloads and broadcasts changes. All handler entry points are synchronized; handlers run
- * on Netty worker threads.
+ * serves downloads and broadcasts changes. Handlers run on Netty worker threads; every entry
+ * point is synchronized on this instance, which serializes all state access without putting any
+ * of the work onto the server main thread.
  */
 public class ServerSyncManager {
 
@@ -47,18 +51,22 @@ public class ServerSyncManager {
     /** playerUuid -> (transferId -> incoming upload) */
     private final Map<UUID, Map<Integer, IncomingTransfer>> uploads = new HashMap<UUID, Map<Integer, IncomingTransfer>>();
 
+    /** playerUuid -> last outgoing transfer id allocated for that player */
+    private final Map<UUID, Integer> lastSentTransferId = new HashMap<UUID, Integer>();
+
     private long lastSaveMillis;
     private boolean dirty;
 
     private ServerSyncManager() {}
 
-    /** Called once per world load from the server proxy. */
+    /** Called once per world load from the common proxy. */
     public synchronized void init(File worldDir) {
         this.dataDir = new File(worldDir, "journeysync");
         this.tileFiles = new TileFiles(new File(dataDir, "tiles"));
         this.manifest = Manifest.fromJson(readStringQuietly(new File(dataDir, "manifest.json")));
         this.waypointStore = new ServerWaypointStore(new File(dataDir, "waypoints.json"));
         this.uploads.clear();
+        this.lastSentTransferId.clear();
         this.lastSaveMillis = System.currentTimeMillis();
         this.dirty = false;
         JourneySync.LOG.info(
@@ -75,31 +83,32 @@ public class ServerSyncManager {
 
     // ------------------------------------------------------------------ events
 
-    public void onHello(EntityPlayerMP player, HelloPacket hello) {
+    public synchronized void onHello(EntityPlayerMP player, HelloPacket hello) {
         if (hello.protocolVersion != PacketHandler.PROTOCOL_VERSION) {
             JourneySync.LOG.warn(
-                "Player {} uses JourneySync protocol {}, server expects {} - ignoring",
+                "Player {} uses JourneySync protocol {} (mod {}), server expects {} - ignoring",
                 player.getCommandSenderName(),
                 hello.protocolVersion,
+                hello.modVersion,
                 PacketHandler.PROTOCOL_VERSION);
+            // Still reply so the client can surface the mismatch and stop cleanly instead of
+            // waiting for a manifest that will never come.
+            sendTo(player, new HelloAckPacket(PacketHandler.PROTOCOL_VERSION, Config.rateLimitKBps));
             return;
         }
-        if (!hello.hasJourneyMap) {
-            JourneySync.LOG.info(
-                "Player {} has JourneySync but no JourneyMap; sync will be inactive on their client",
-                player.getCommandSenderName());
-        }
+        JourneySync.LOG.info(
+            "Player {} joined with JourneySync {} (JourneyMap present: {})",
+            player.getCommandSenderName(),
+            hello.modVersion,
+            hello.hasJourneyMap);
         sendTo(player, new HelloAckPacket(PacketHandler.PROTOCOL_VERSION, Config.rateLimitKBps));
         sendManifest(player);
         sendWaypoints(player);
     }
 
-    public void onTileRequest(EntityPlayerMP player, List<String> paths) {
-        int sent = 0;
+    /** Batch size is bounded at the wire level by {@link TileRequestPacket#MAX_BATCH}. */
+    public synchronized void onTileRequest(EntityPlayerMP player, List<String> paths) {
         for (String path : paths) {
-            if (sent++ >= tileRequestLimit()) {
-                break;
-            }
             TileKey key = TileKey.parse(path);
             if (key == null) {
                 continue;
@@ -115,12 +124,7 @@ public class ServerSyncManager {
         }
     }
 
-    private int tileRequestLimit() {
-        return 64;
-    }
-
-    public void onTileUploadBegin(EntityPlayerMP player,
-        com.donkeytt.journeysync.network.packets.TileUploadBeginPacket msg) {
+    public synchronized void onUploadBegin(EntityPlayerMP player, TileTransferBegin msg) {
         TileKey key = TileKey.parse(msg.relPath);
         if (key == null || msg.totalBytes <= 0 || msg.totalBytes > Config.maxTileBytes) {
             JourneySync.LOG.warn(
@@ -128,7 +132,7 @@ public class ServerSyncManager {
                 player.getCommandSenderName(),
                 msg.relPath,
                 msg.totalBytes);
-            sendTo(player, new TileUploadAckPacket(msg.transferId, 2));
+            sendTo(player, new TileTransferAck(msg.transferId, TileTransferAck.REJECTED));
             return;
         }
         Map<Integer, IncomingTransfer> byId = uploads.get(player.getUniqueID());
@@ -141,8 +145,7 @@ public class ServerSyncManager {
             new IncomingTransfer(msg.transferId, msg.relPath, msg.sha1, msg.totalBytes, msg.chunkSize));
     }
 
-    public void onTileUploadData(EntityPlayerMP player,
-        com.donkeytt.journeysync.network.packets.TileUploadDataPacket msg) {
+    public synchronized void onUploadData(EntityPlayerMP player, TileChunk msg) {
         Map<Integer, IncomingTransfer> byId = uploads.get(player.getUniqueID());
         if (byId == null) {
             return;
@@ -161,7 +164,7 @@ public class ServerSyncManager {
     private void finishUpload(EntityPlayerMP player, IncomingTransfer transfer) {
         if (!transfer.verifySha1()) {
             JourneySync.LOG.warn("Upload hash mismatch from {}: {}", player.getCommandSenderName(), transfer.relPath);
-            sendTo(player, new TileUploadAckPacket(transfer.transferId, 2));
+            sendTo(player, new TileTransferAck(transfer.transferId, TileTransferAck.REJECTED));
             return;
         }
         TileKey key = TileKey.parse(transfer.relPath);
@@ -186,7 +189,9 @@ public class ServerSyncManager {
 
         TileEntry existing = manifest.tiles.get(key.relPath());
         if (existing != null && existing.sha1.equals(sha1)) {
-            sendTo(player, new TileUploadAckPacket(transfer.transferId, 1)); // duplicate (or nothing new after merge)
+            sendTo(
+                player,
+                new TileTransferAck(transfer.transferId, TileTransferAck.NOTHING_NEW, existing.sha1, existing.size));
             return;
         }
 
@@ -194,38 +199,39 @@ public class ServerSyncManager {
             tileFiles.writeAtomic(key, data);
         } catch (Exception e) {
             JourneySync.LOG.error("Failed storing tile {}", key.relPath(), e);
-            sendTo(player, new TileUploadAckPacket(transfer.transferId, 2));
+            sendTo(player, new TileTransferAck(transfer.transferId, TileTransferAck.REJECTED));
             return;
         }
 
         manifest.tiles.put(key.relPath(), new TileEntry(sha1, data.length));
         dirty = true;
-        sendTo(player, new TileUploadAckPacket(transfer.transferId, 0));
+        sendTo(player, new TileTransferAck(transfer.transferId, TileTransferAck.OK, sha1, data.length));
 
         // Broadcast to everyone else.
         broadcastTile(key, data, player);
     }
 
-    public void onTileAck(EntityPlayerMP player, com.donkeytt.journeysync.network.packets.TileAckPacket msg) {
-        if (!msg.ok && Config.logDebug) {
+    public synchronized void onDownloadAck(EntityPlayerMP player, TileTransferAck msg) {
+        if (msg.code != TileTransferAck.OK && Config.logDebug) {
             JourneySync.LOG.debug("Tile download failed for {}", player.getCommandSenderName());
         }
     }
 
-    public void onWaypointChange(EntityPlayerMP player, WaypointRecord record) {
+    public synchronized void onWaypointChange(EntityPlayerMP player, WaypointRecord record) {
         WaypointRecord accepted = waypointStore.apply(
             record,
             player.getUniqueID()
                 .toString(),
             isOp(player));
-        waypointStore.save();
         if (accepted != null) {
+            dirty = true; // persisted with the next periodic save
             broadcastWaypoints();
         }
     }
 
     public synchronized void onPlayerLogout(EntityPlayerMP player) {
         uploads.remove(player.getUniqueID());
+        lastSentTransferId.remove(player.getUniqueID());
     }
 
     /** Called from the server tick handler: periodic persistence. */
@@ -274,25 +280,16 @@ public class ServerSyncManager {
 
     private void sendTile(EntityPlayerMP player, TileKey key, byte[] data) {
         String sha1 = Hashing.sha1Hex(data);
-        int chunkSize = Math.min(Config.chunkSizeBytes, BlobPacket.CHUNK_SIZE);
-        int chunks = (data.length + chunkSize - 1) / chunkSize;
-        sendTo(player, new TileBeginPacket(nextTransferId(player), key.relPath(), sha1, data.length, chunkSize));
-        int transferId = lastSentTransferId.get(player.getUniqueID());
-        for (int seq = 0; seq < chunks; seq++) {
-            int off = seq * chunkSize;
-            int len = Math.min(chunkSize, data.length - off);
-            byte[] chunk = new byte[len];
-            System.arraycopy(data, off, chunk, 0, len);
-            sendTo(player, new TileDataPacket(transferId, seq, chunk));
-        }
+        int chunkSize = TileChunking.effectiveChunkSize(Config.chunkSizeBytes);
+        int transferId = nextTransferId(player);
+        sendTo(player, new TileTransferBegin(transferId, key.relPath(), sha1, data.length, chunkSize));
+        TileChunking
+            .sendChunks(data, chunkSize, transferId, (id, seq, chunk) -> sendTo(player, new TileChunk(id, seq, chunk)));
     }
 
-    /** server-side per-player outgoing transfer id counter */
-    private final Map<UUID, Integer> lastSentTransferId = new HashMap<UUID, Integer>();
-
     private int nextTransferId(EntityPlayerMP player) {
-        int id = lastSentTransferId.containsKey(player.getUniqueID()) ? lastSentTransferId.get(player.getUniqueID()) + 1
-            : 1;
+        Integer last = lastSentTransferId.get(player.getUniqueID());
+        int id = last == null ? 1 : last + 1;
         lastSentTransferId.put(player.getUniqueID(), id);
         return id;
     }
@@ -312,7 +309,7 @@ public class ServerSyncManager {
             .getConfigurationManager().playerEntityList;
     }
 
-    private void sendTo(EntityPlayerMP player, cpw.mods.fml.common.network.simpleimpl.IMessage msg) {
+    private void sendTo(EntityPlayerMP player, IMessage msg) {
         PacketHandler.wrapper.sendTo(msg, player);
     }
 

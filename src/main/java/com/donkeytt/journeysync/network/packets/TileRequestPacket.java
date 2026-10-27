@@ -29,6 +29,9 @@ public class TileRequestPacket implements IMessage {
     @Override
     public void fromBytes(ByteBuf buf) {
         int size = BufUtil.readVarInt(buf, 2);
+        if (size > MAX_BATCH) {
+            throw new IllegalArgumentException("Tile request batch too large: " + size);
+        }
         paths = new ArrayList<String>(size);
         for (int i = 0; i < size; i++) {
             paths.add(ByteBufUtils.readUTF8String(buf));

@@ -19,8 +19,8 @@ import cpw.mods.fml.common.Loader;
  * <ul>
  * <li>{@code journeymap.client.io.FileHandler.getJMWorldDir(Minecraft)} — current world's cache
  * directory</li>
- * <li>{@code journeymap.client.model.RegionImageCache.instance().clear()} — force JM to re-read
- * tiles from disk</li>
+ * <li>{@code RegionImageSet.getHolder(...)} → `ImageHolder.getTexture()` → `TextureImpl.setImage(...)} —
+ * refresh just one changed tile's live texture (gated: only while JM is idle on that tile)</li>
  * <li>{@code journeymap.client.waypoint.WaypointStore.instance().reset()} — force JM to re-scan
  * the waypoints directory</li>
  * </ul>
@@ -31,7 +31,6 @@ public final class JmBridge {
     private static boolean resolved;
     private static Method getJMWorldDir;
     private static Object regionImageCache;
-    private static Method regionCacheClear;
     private static Object waypointStore;
     private static Method waypointReset;
 
@@ -45,7 +44,6 @@ public final class JmBridge {
     private static Method holderGetTexture;
     private static Method textureSetImage;
 
-    private static long lastRegionClear;
     private static long lastWaypointReset;
 
     // region re-render requests (repair tool: JM only re-renders chunks its task system decides to,
@@ -84,10 +82,8 @@ public final class JmBridge {
         }
         try {
             Class<?> cacheClass = Class.forName("journeymap.client.model.RegionImageCache");
-            Object cache = cacheClass.getMethod("instance")
+            regionImageCache = cacheClass.getMethod("instance")
                 .invoke(null);
-            regionCacheClear = cacheClass.getMethod("clear");
-            regionImageCache = cache;
         } catch (Throwable t) {
             JourneySync.LOG.error("JourneyMap RegionImageCache integration unavailable", t);
         }
@@ -185,33 +181,13 @@ public final class JmBridge {
         return best;
     }
 
-    /** Force JM to drop its in-memory tile cache so externally written tiles get read from disk. */
-    public static void clearRegionImageCache() {
-        resolve();
-        if (regionCacheClear == null) {
-            return;
-        }
-        long now = System.currentTimeMillis();
-        if (now - lastRegionClear < 10_000) {
-            return; // throttle: JM rebuilds this cache expensively
-        }
-        lastRegionClear = now;
-        try {
-            regionCacheClear.invoke(regionImageCache);
-        } catch (Throwable t) {
-            if (ConfigDebugOnce.log("regionclear")) {
-                JourneySync.LOG.error("RegionImageCache.clear failed", t);
-            }
-        }
-    }
-
     /**
-     * Update a single tile's GL texture from freshly applied bytes. A full
-     * {@link #clearRegionImageCache()} expires every viewed tile's texture at once and makes JM
-     * re-render all of them from its in-memory region data - stale regions flicker and each
-     * re-render can overwrite the freshly restored file. Pushing the new pixels into just this
-     * tile's texture avoids that storm entirely. Returns false when the targeted route is
-     * unavailable and the caller should fall back to the full clear.
+     * Update a single tile's GL texture from freshly applied bytes. Only meaningful while JM is
+     * idle on this tile: a push under a live JM render is overwritten by its next texture update
+     * from its own master image, and refreshing a tile JM is not rendering is unnecessary anyway
+     * (its image cache expires within ~15s and re-reads the file). There is deliberately no
+     * full-cache-clear fallback: it expires every viewed tile at once, makes JM re-render them
+     * from stale in-memory regions, and visibly flickers.
      */
     public static boolean refreshTile(File worldDir, com.donkeytt.journeysync.data.TileKey key, byte[] png) {
         resolve();

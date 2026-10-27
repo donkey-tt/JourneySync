@@ -72,13 +72,14 @@ public class Manifest {
     }
 
     /**
-     * Decide what the client should upload: local tiles the server does not have, or has with
-     * different content.
+     * Decide what the client might upload: local tiles the server does not have, or has with
+     * different content. Regression pruning is deliberately NOT done here - the caller also
+     * knows the client's own last-synced baseline and applies both baselines in one place (see
+     * {@code UploadGuards.regresses}).
      *
      * @param localSha1 tiles present on local disk (relPath -> sha1)
-     * @param localSize tile file sizes on local disk (relPath -> bytes)
      */
-    public Set<String> diffUpload(Map<String, String> localSha1, Map<String, Long> localSize) {
+    public Set<String> diffUpload(Map<String, String> localSha1) {
         Set<String> out = new LinkedHashSet<String>();
         for (Map.Entry<String, String> e : localSha1.entrySet()) {
             TileEntry server = tiles.get(e.getKey());
@@ -88,10 +89,6 @@ public class Manifest {
             }
             if (server.sha1.equals(e.getValue())) {
                 continue;
-            }
-            Long size = localSize.get(e.getKey());
-            if (isRegression(server.size, size == null ? 0 : size.longValue())) {
-                continue; // local render looks less complete than the server's; never clobber it
             }
             out.add(e.getKey());
         }

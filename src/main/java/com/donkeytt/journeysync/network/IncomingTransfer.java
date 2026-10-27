@@ -22,6 +22,7 @@ public class IncomingTransfer {
     private final List<byte[]> chunks;
     private final BitSet received;
     private int chunksReceived;
+    private byte[] assembled;
 
     public IncomingTransfer(int transferId, String relPath, String sha1, int totalBytes, int chunkSize) {
         this.transferId = transferId;
@@ -56,15 +57,19 @@ public class IncomingTransfer {
         return chunksReceived == expectedChunks;
     }
 
-    /** Join chunks in sequence order. */
+    /** Join chunks in sequence order (assembled once, then cached; the chunk list is freed). */
     public byte[] getData() {
-        byte[] out = new byte[totalBytes];
-        int off = 0;
-        for (byte[] chunk : chunks) {
-            System.arraycopy(chunk, 0, out, off, chunk.length);
-            off += chunk.length;
+        if (assembled == null) {
+            byte[] out = new byte[totalBytes];
+            int off = 0;
+            for (byte[] chunk : chunks) {
+                System.arraycopy(chunk, 0, out, off, chunk.length);
+                off += chunk.length;
+            }
+            assembled = out;
+            chunks.clear(); // late duplicate chunks are rejected by the BitSet, never stored
         }
-        return out;
+        return assembled;
     }
 
     /** Verify assembled content against the announced SHA-1. */

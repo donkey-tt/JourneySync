@@ -85,7 +85,7 @@ public class Config {
             tileUploadCooldownSeconds,
             0,
             3600,
-            "After uploading a tile, wait this many minutes before uploading that tile again unless it"
+            "After uploading a tile, wait this many seconds before uploading that tile again unless it"
                 + " grew significantly (suppresses cosmetic re-render jitter; 0 = off)");
 
         if (configuration.hasChanged()) {

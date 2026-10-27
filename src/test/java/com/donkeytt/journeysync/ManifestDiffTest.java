@@ -58,28 +58,24 @@ public class ManifestDiffTest {
         local.put("DIM0/day/a.png", "h1"); // same -> no upload
         local.put("DIM0/day/b.png", "hX"); // different -> upload
         local.put("DIM0/day/new.png", "h9"); // server lacks -> upload
-        Set<String> ul = m.diffUpload(local, new HashMap<String, Long>());
+        Set<String> ul = m.diffUpload(local);
         assertEquals(2, ul.size());
         assertTrue(ul.contains("DIM0/day/b.png"));
         assertTrue(ul.contains("DIM0/day/new.png"));
     }
 
     @Test
-    public void uploadSkipsRegressionAgainstServerVersion() {
+    public void uploadRegressionPruningIsTheCallersJob() {
+        // diffUpload deliberately returns everything the server lacks/differs on; the join-time
+        // prune against both baselines (server entry + own last sync) happens in one place in
+        // the manager via UploadGuards.regresses.
         Manifest m = new Manifest();
         m.tiles.put("DIM0/day/a.png", new TileEntry("hFull", 100_000));
         Map<String, String> local = new HashMap<String, String>();
         local.put("DIM0/day/a.png", "hPartial");
-        Map<String, Long> sizes = new HashMap<String, Long>();
-        sizes.put("DIM0/day/a.png", 5_000L); // less than half of the server's -> never upload
-        assertTrue(
-            m.diffUpload(local, sizes)
-                .isEmpty());
-
-        sizes.put("DIM0/day/a.png", 90_000L); // comparable size -> normal upload
         assertEquals(
             1,
-            m.diffUpload(local, sizes)
+            m.diffUpload(local)
                 .size());
     }
 

@@ -97,12 +97,13 @@ Sync follows one lifecycle, repeated on every join:
 
 | Option | Default | Description |
 |---|---|---|
-| `syncEnabled` | `true` | Master switch for all syncing |
 | `uploadEnabled` / `downloadEnabled` | `true` | Directional toggles |
-| `rateLimitKBps` | `0` | Upload/download throttle (0 = unlimited) |
-| `scanIntervalSeconds` | `5` | How often the local cache is scanned for changes |
-| `uploadSettleSeconds` | `3` | A changed tile is uploaded only after its file has stayed unchanged this long, debouncing re-renders while moving (0 = off) |
-| `tileUploadCooldownSeconds` | `300` | After uploading a tile, wait this long before uploading it again unless it grew significantly (suppresses cosmetic re-render jitter; 0 = off) |
+| `rateLimitKBps` | `0` | Client upload throttle (0 = unlimited) |
+| `scanIntervalSeconds` | `2` | How often the local cache is scanned for changes |
+| `uploadSettleSeconds` | `2` | A changed tile is uploaded only after its file has stayed unchanged this long, debouncing re-renders while moving (0 = off) |
+| `tileUploadCooldownSeconds` | `60` | After uploading a tile, wait this long before uploading it again unless it grew significantly (suppresses cosmetic re-render jitter; 0 = off) |
+| `chunkSizeBytes` | `24576` | Network chunk payload size in bytes (4 KB–28 KB) |
+| `maxTileBytes` | `32 MiB` | Sanity limit for a single tile transfer |
 | `logDebug` | `false` | Verbose logging |
 
 ## Building
@@ -132,12 +133,27 @@ time — JM constructs them late and recreates them per world):
 
 ```
 com.donkeytt.journeysync/
-├── client/   ClientSyncManager (worker-thread state machine), JmBridge, commands, pixel guards
-├── server/   ServerSyncManager (aggregation, pixel merge, broadcast), ServerWaypointStore (tombstones)
-├── network/  packets, chunk reassembly, rate limiter
-├── data/     TileKey / Manifest / WaypointRecord / PixelMerge
+├── client/   ClientSyncManager (single-threaded state machine; network handlers only enqueue)
+│             ├─ UploadGuards      pure upload decision chain (unit-tested)
+│             ├─ QuietPeriods      per-tile debounce windows (cooldown / restore / inbound)
+│             ├─ LocalTileIndex    in-memory view of the JM tile directory (stat + hash)
+│             ├─ RenderUnionCache  per-tile pixel union of every render seen this session
+│             ├─ ShadowStore       server-authoritative reference copies for pixel guards
+│             ├─ TileWatcher       file-watch fast path (scan interval is the backstop)
+│             ├─ WaypointSync      waypoint scan / outbox / blob application
+│             └─ JmBridge          all JourneyMap reflection, isolated
+├── server/   ServerSyncManager (aggregation, pixel merge, broadcast; synchronized handlers),
+│             ServerWaypointStore (tombstones)
+├── network/  packets (bidirectional transfer begin/chunk/ack), chunking, reassembly,
+│             rate limiter
+├── data/     TileKey / Manifest / WaypointRecord / PixelMerge / PixelInfo
 └── io/       SHA-1 hashing, atomic tile writes
 ```
+
+Threading model: on the client, every inbound packet is enqueued and consumed by one worker
+thread (no locks, one owner for all sync state); UI side effects are deferred to the client tick.
+On the server, handlers run on Netty threads behind a single lock — all state access is
+serialized without touching the server main thread.
 
 ---
 
