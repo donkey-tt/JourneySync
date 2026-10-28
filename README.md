@@ -72,7 +72,7 @@ Sync follows one lifecycle, repeated on every join:
 | **1. Handshake** | Client connects, announces itself. Server replies with its configuration and the current manifest (every tile's SHA-1, gzipped) plus all shared waypoints. |
 | **2. Diff** | Client compares the manifest against (a) tiles already on disk and (b) hashes it synced last time. Anything missing or changed goes onto a download list; anything it has that the server doesn't goes onto an upload list. Identical content on both sides is skipped entirely. |
 | **3. Transfer** | Tiles move in both directions as Schematica-style ACKed chunks (≤ 24 KB per packet, token-bucket rate limited). Each tile is verified against its SHA-1 before being accepted. Progress is reported in chat. |
-| **4. Apply** | Downloaded tiles are written to the JourneyMap cache as temp files + atomic move, then the live map texture is refreshed in place via reflection (`RegionImageCache.clear()` only as fallback), so other viewed tiles don't flicker. Waypoint changes are written likewise, followed by `WaypointStore.reset()`. |
+| **4. Apply** | Downloaded tiles are written to the JourneyMap cache as temp files + atomic move, then the live map texture (day/night and cave layers alike) is refreshed in place via reflection, so other viewed tiles don't flicker. Waypoint changes are written likewise, followed by `WaypointStore.reset()`. |
 | **5. Watch** | The client watches the tile directories directly (a periodic scan is the backstop): each JourneyMap render is picked up immediately, and uploads are debounced until the file stat settles. Every version of a tile seen this session is unioned into that tile's upload payload — a re-render that dropped pixels (chunks unloaded) uploads its pixels anyway, so nothing is lost. Tiles pushed by other players arrive and are applied as in phase 4; a tile whose local render regressed is automatically re-downloaded for display. |
 
 <details>
@@ -126,8 +126,7 @@ time — JM constructs them late and recreates them per world):
 | Reflection target | Purpose |
 |---|---|
 | `FileHandler.getJMWorldDir(Minecraft)` | Locate the active JM cache directory (world GUID dir) |
-| `RegionImageSet.getHolder(...)` → `ImageHolder.getTexture()` → `TextureImpl.setImage(...)` | Refresh just the changed tile's live texture — no full cache clear, no flicker |
-| `RegionImageCache.instance().clear()` | Fallback when the targeted refresh is unavailable |
+| `RegionImageSet.getHolder(...)` → `ImageHolder.getTexture()` → `TextureImpl.setImage(...)` | Refresh just the changed tile's live texture (surface and cave layers) — no full cache clear, no flicker |
 | `WaypointStore.instance().reset()` | Force JM to re-scan waypoint files |
 | `JourneymapClient.toggleTask(MapRegionTask.Manager, true, RegionCoord)` | Queue a region re-render (`/jsync rerender`), gated on the task controller's busy flag |
 

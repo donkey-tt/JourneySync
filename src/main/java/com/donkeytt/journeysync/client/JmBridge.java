@@ -34,10 +34,11 @@ public final class JmBridge {
     private static Object waypointStore;
     private static Method waypointReset;
 
-    // targeted single-tile texture refresh (falls back to the full cache clear when unavailable)
+    // targeted single-tile texture refresh (day/night and cave vSlice layers alike)
     private static boolean tileRefreshResolved;
     private static Method mapTypeDay;
     private static Method mapTypeNight;
+    private static Method mapTypeUnderground;
     private static Method regionCoordFromRegionPos;
     private static Method getRegionImageSet;
     private static Method getHolder;
@@ -99,6 +100,7 @@ public final class JmBridge {
             Class<?> mapTypeClass = Class.forName("journeymap.client.model.MapType");
             mapTypeDay = mapTypeClass.getMethod("day", int.class);
             mapTypeNight = mapTypeClass.getMethod("night", int.class);
+            mapTypeUnderground = mapTypeClass.getMethod("underground", Integer.class, int.class);
             Class<?> coordClass = Class.forName("journeymap.client.model.RegionCoord");
             regionCoordFromRegionPos = coordClass
                 .getMethod("fromRegionPos", File.class, int.class, int.class, int.class);
@@ -114,7 +116,7 @@ public final class JmBridge {
             textureSetImage = textureClass.getMethod("setImage", java.awt.image.BufferedImage.class, boolean.class);
             tileRefreshResolved = true;
         } catch (Throwable t) {
-            JourneySync.LOG.error("JourneyMap targeted tile refresh unavailable; falling back to full cache clears", t);
+            JourneySync.LOG.error("JourneyMap targeted tile refresh unavailable", t);
         }
         try {
             Class<?> jmClientClass = Class.forName("journeymap.client.JourneymapClient");
@@ -182,23 +184,22 @@ public final class JmBridge {
     }
 
     /**
-     * Update a single tile's GL texture from freshly applied bytes. Only meaningful while JM is
-     * idle on this tile: a push under a live JM render is overwritten by its next texture update
-     * from its own master image, and refreshing a tile JM is not rendering is unnecessary anyway
-     * (its image cache expires within ~15s and re-reads the file). There is deliberately no
-     * full-cache-clear fallback: it expires every viewed tile at once, makes JM re-render them
-     * from stale in-memory regions, and visibly flickers.
+     * Update a single tile's GL texture from freshly applied bytes, for surface (day/night) and
+     * cave (vSlice) layers alike: the tile's kind is the directory name, which is exactly
+     * {@code Integer.toString(vSlice)} for underground map types (RegionImageHandler.getImageDir).
+     * Only meaningful while JM is idle on this tile: a push under a live JM render is overwritten
+     * by its next texture update from its own master image, and refreshing a tile JM is not
+     * rendering is unnecessary anyway (its image cache expires within ~15s and re-reads the file).
+     * There is deliberately no full-cache-clear fallback: it expires every viewed tile at once,
+     * makes JM re-render them from stale in-memory regions, and visibly flickers.
      */
     public static boolean refreshTile(File worldDir, com.donkeytt.journeysync.data.TileKey key, byte[] png) {
         resolve();
         if (!tileRefreshResolved || worldDir == null) {
             return false;
         }
-        if (!"day".equals(key.kind) && !"night".equals(key.kind)) {
-            return false; // cave/underground layers use vSlice-typed MapTypes; keep the full clear
-        }
         try {
-            Object mapType = ("night".equals(key.kind) ? mapTypeNight : mapTypeDay).invoke(null, key.dimension);
+            Object mapType = mapTypeFor(key);
             Object coord = regionCoordFromRegionPos.invoke(null, worldDir, key.regionX, key.regionZ, key.dimension);
             Object set = getRegionImageSet.invoke(regionImageCache, coord);
             if (set == null) {
@@ -224,6 +225,21 @@ public final class JmBridge {
             }
             return false;
         }
+    }
+
+    /**
+     * The JM MapType for a tile: "day"/"night" map to the surface factories, anything else is a
+     * cave vSlice (TileKey's kind regex admits only those three shapes). MapType equality is
+     * (name, vSlice, dimension), so the constructed type matches the holder key exactly.
+     */
+    private static Object mapTypeFor(com.donkeytt.journeysync.data.TileKey key) throws Exception {
+        if ("day".equals(key.kind)) {
+            return mapTypeDay.invoke(null, key.dimension);
+        }
+        if ("night".equals(key.kind)) {
+            return mapTypeNight.invoke(null, key.dimension);
+        }
+        return mapTypeUnderground.invoke(null, Integer.valueOf(key.kind), key.dimension);
     }
 
     /** Force JM to re-scan the waypoints directory. */
