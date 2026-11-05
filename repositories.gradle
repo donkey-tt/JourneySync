@@ -1,5 +1,10 @@
 // Add any additional repositories for your dependencies here.
 
 repositories {
-
+    // JitPack fallback for GTNH artifacts while nexus.gtnewhorizons.com is unavailable
+    // (returns HTTP 525 during outages). Harmless when the GTNH maven is up.
+    maven {
+        name = "JitPack"
+        url = uri("https://jitpack.io")
+    }
 }

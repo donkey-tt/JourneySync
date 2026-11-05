@@ -16,7 +16,10 @@ public class Config {
     public static boolean uploadEnabled = true;
     public static boolean downloadEnabled = true;
     public static boolean logDebug = false;
-
+    /** Group map/waypoint sync by GTNHLib team instead of server-wide. */
+    public static boolean syncByTeam = true;
+    /** JourneyMap death waypoints ({@code type="Death"}) stay private to the player. */
+    public static boolean shareDeathWaypoints = false;
     // transfer
     /** 0 = unlimited */
     public static int rateLimitKBps = 0;
@@ -42,7 +45,18 @@ public class Config {
             downloadEnabled,
             "Download map tiles/waypoints shared by other players");
         logDebug = configuration.getBoolean("logDebug", CATEGORY_GENERAL, logDebug, "Verbose debug logging");
-
+        syncByTeam = configuration.getBoolean(
+            "syncByTeam",
+            CATEGORY_GENERAL,
+            syncByTeam,
+            "Group map/waypoint sync by GTNHLib team instead of server-wide (requires GTNHLib;"
+                + " players without a team only share with themselves)");
+        shareDeathWaypoints = configuration.getBoolean(
+            "shareDeathWaypoints",
+            CATEGORY_GENERAL,
+            shareDeathWaypoints,
+            "Share JourneyMap death waypoints (type=Death) with the sync scope; false keeps them"
+                + " private to the player");
         rateLimitKBps = configuration.getInt(
             "rateLimitKBps",
             CATEGORY_TRANSFER,

@@ -374,6 +374,15 @@ public class ClientSyncManager {
         if (type == PacketHandler.BLOB_MANIFEST) {
             serverManifest = Manifest.fromJson(json);
             JourneySync.LOG.info("Received manifest: {} tiles", serverManifest.tiles.size());
+            // A manifest arriving past the initial diff means the server pushed a new readable
+            // scope (team join/leave): restart from DIFFING so the worker re-scans and re-diffs
+            // against the new manifest, and re-announce completion once the queues drain.
+            if (phase == Phase.TRANSFERRING || phase == Phase.WATCHING) {
+                phase = Phase.DIFFING;
+                announcedComplete = false;
+                failedTiles.clear(); // failures were recorded against the old scope's manifest
+                chatQueue.offer("journeysync.chat.scope_change");
+            }
         } else if (type == PacketHandler.BLOB_WAYPOINTS_FULL) {
             // Route through the worker: applying writes waypoint files, which requires jmDir -
             // not yet resolved this early after join. dispatch() stashes it until then.

@@ -42,5 +42,13 @@ dependencies {
         devOnlyNonPublishable(rfg.deobf(files(jmJar)))
     }
     testImplementation("junit:junit:4.13.2")
+
+    // GTNHLib - optional runtime integration for team-scoped sync (gated behind
+    // Loader.isModLoaded("gtnhlib"); all imports live in server/TeamBridge.java).
+    // Preferred coordinate on the GTNH maven: com.github.GTNewHorizons:GTNHLib:0.11.56:dev
+    // While nexus.gtnewhorizons.com has a 525 outage we resolve the cached jitpack build
+    // instead; rfg.deobf converts the obfuscated jar for compile + dev runtime use.
+    // Non-transitive on purpose: dev-runtime dependency list stays explicit.
+    devOnlyNonPublishable(rfg.deobf("com.github.GTNewHorizons:GTNHLib:0.11.56")) { transitive = false }
     //runtimeOnlyNonPublishable("com.github.GTNewHorizons:NotEnoughItems:2.7.69-GTNH:dev")
 }

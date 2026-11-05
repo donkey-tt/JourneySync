@@ -9,8 +9,10 @@ import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.function.Consumer;
 
+import com.donkeytt.journeysync.Config;
 import com.donkeytt.journeysync.JourneySync;
 import com.donkeytt.journeysync.data.WaypointRecord;
 import com.google.gson.Gson;
@@ -31,8 +33,13 @@ final class WaypointSync {
     /** Local changes waiting to be sent. */
     private final List<WaypointRecord> outbox = new ArrayList<WaypointRecord>();
 
-    /** Waypoint id -> hash of the file content as seen at the last scan (echo suppression). */
-    private final Map<String, Integer> scanHash = new HashMap<String, Integer>();
+    /**
+     * Waypoint id -> hash of the file content as seen at the last scan (echo suppression). Package-private for tests.
+     */
+    final Map<String, Integer> scanHash = new HashMap<String, Integer>();
+
+    /** Synced ids already tombstoned for having become unshareable (e.g. death waypoints). */
+    private final Set<String> unsyncSent = new HashSet<String>();
 
     WaypointSync(ClientState state, Consumer<WaypointRecord> sender) {
         this.state = state;
@@ -43,6 +50,7 @@ final class WaypointSync {
     void reset() {
         outbox.clear();
         scanHash.clear();
+        unsyncSent.clear();
     }
 
     /** Scan the JM waypoints directory; queue local changes (adds, edits, deletions). */
@@ -60,6 +68,18 @@ final class WaypointSync {
                     String json = new String(Files.readAllBytes(f.toPath()), StandardCharsets.UTF_8);
                     WaypointRecord record = WaypointRecord.fromWaypointJson(json);
                     if (record == null || record.id == null || record.id.isEmpty()) {
+                        continue;
+                    }
+                    if (!Config.shareDeathWaypoints && record.isDeath()) {
+                        // Death waypoints stay local: not queued, not tracked for deletions.
+                        // One-time unsync: if a previous version already shared this id, send a
+                        // tombstone so the scope store drops it, then stop tracking it.
+                        if (state.waypointRevs.containsKey(record.id) && unsyncSent.add(record.id)) {
+                            WaypointRecord tombstone = new WaypointRecord();
+                            tombstone.id = record.id;
+                            tombstone.deleted = true;
+                            outbox.add(tombstone);
+                        }
                         continue;
                     }
                     current.put(record.id, json.hashCode());
@@ -101,7 +121,16 @@ final class WaypointSync {
 
     /**
      * Apply a full-waypoint blob from the server (revision-gated, tombstones delete files).
-     * Returns true when anything changed on disk, so the caller can trigger a JM waypoint reload.
+     * Returns true when anything changed on disk or in sync state, so the caller can trigger a
+     * JM waypoint reload and persist the state.
+     *
+     * <p>
+     * The blob is the complete state of the client's readable scopes, so afterwards every
+     * server-known id absent from the record list is pruned: the record left our scope (team
+     * switch), so its file is deleted and its rev/scan-hash bookkeeping dropped rather than
+     * tombstoned. Locally created waypoints not yet acknowledged by the server are absent from
+     * {@code state.waypointRevs} and therefore untouched.
+     * </p>
      */
     boolean applyServerBlob(String json, File jmDir) {
         try {
@@ -109,15 +138,27 @@ final class WaypointSync {
             if (stored == null || stored.records == null) {
                 return false;
             }
+            File waypointDir = new File(jmDir, "waypoints");
+            Set<String> listed = new HashSet<String>();
             boolean any = false;
             for (WaypointRecord record : stored.records) {
+                listed.add(record.id);
                 Long applied = state.waypointRevs.get(record.id);
                 if (applied != null && applied.longValue() >= record.rev) {
                     continue;
                 }
-                File file = new File(new File(jmDir, "waypoints"), record.fileName());
+                if (!Config.shareDeathWaypoints && !record.deleted && record.isDeath()) {
+                    // Death waypoints are private: never let a leftover server record (from an
+                    // older version) rewrite the local file. Tombstones still flow below.
+                    state.waypointRevs.put(record.id, Long.valueOf(record.rev));
+                    any = true;
+                    continue;
+                }
+                File file = new File(waypointDir, record.fileName());
                 if (record.deleted) {
-                    if (file.isFile() && !file.delete()) {
+                    // A record we ourselves unsynced (e.g. our own death waypoint) must not
+                    // delete the user's local file; everyone else deletes their synced copy.
+                    if (!unsyncSent.contains(record.id) && file.isFile() && !file.delete()) {
                         JourneySync.LOG.warn("Could not delete waypoint file {}", file);
                     }
                 } else {
@@ -135,6 +176,22 @@ final class WaypointSync {
                     record.id,
                     record.toWaypointJson()
                         .hashCode());
+                any = true;
+            }
+            // Prune stale ids: the blob covers every readable scope, so a server-known id that
+            // is not listed no longer belongs to us (e.g. a team record after switching teams).
+            for (String id : new HashSet<String>(state.waypointRevs.keySet())) {
+                if (listed.contains(id)) {
+                    continue;
+                }
+                state.waypointRevs.remove(id);
+                scanHash.remove(id);
+                WaypointRecord probe = new WaypointRecord();
+                probe.id = id;
+                File file = new File(waypointDir, probe.fileName());
+                if (file.isFile() && !file.delete()) {
+                    JourneySync.LOG.warn("Could not delete out-of-scope waypoint file {}", file);
+                }
                 any = true;
             }
             return any;

@@ -51,6 +51,11 @@ public class WaypointRecord implements Comparable<WaypointRecord> {
             .replaceAll("_") + ".json";
     }
 
+    /** JourneyMap auto-created death waypoints are marked {@code type="Death"}. */
+    public boolean isDeath() {
+        return "Death".equalsIgnoreCase(type);
+    }
+
     /** Build a fresh local record from parsed waypoint JSON fields. */
     public static WaypointRecord fromWaypointJson(String json) {
         return WaypointJson.GSON.fromJson(json, WaypointRecord.class);

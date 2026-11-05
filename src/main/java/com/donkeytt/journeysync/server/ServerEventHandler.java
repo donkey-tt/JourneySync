@@ -5,6 +5,8 @@ import java.io.File;
 import net.minecraft.entity.player.EntityPlayerMP;
 import net.minecraftforge.common.MinecraftForge;
 
+import com.donkeytt.journeysync.JourneySync;
+
 import cpw.mods.fml.common.FMLCommonHandler;
 import cpw.mods.fml.common.eventhandler.SubscribeEvent;
 import cpw.mods.fml.common.gameevent.PlayerEvent;
@@ -22,6 +24,12 @@ public class ServerEventHandler {
             .bus()
             .register(handler);
         MinecraftForge.EVENT_BUS.register(handler);
+        // Lazy-loaded bridge: safe to invoke when GTNHLib is absent; registers its own listeners.
+        if (TeamBridge.teamSyncActive()) {
+            TeamBridge.registerEvents();
+        } else {
+            JourneySync.LOG.info("JourneySync: GTNHLib absent or syncByTeam disabled; server-wide sync");
+        }
     }
 
     /** Called from the common proxy once the overworld save directory is known. */

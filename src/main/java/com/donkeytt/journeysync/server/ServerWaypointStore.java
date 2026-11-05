@@ -5,9 +5,11 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.LongSupplier;
 
 import com.donkeytt.journeysync.JourneySync;
 import com.donkeytt.journeysync.data.WaypointRecord;
@@ -27,7 +29,10 @@ public class ServerWaypointStore {
     private final File file;
     private final Map<String, WaypointRecord> byId = new LinkedHashMap<String, WaypointRecord>();
 
-    /** Revision sequence: every accepted change assigns {@code rev = ++epoch} to its record. */
+    /**
+     * Highest revision this store has ever assigned, persisted for back-compat. New revisions come
+     * from the server-wide {@link WaypointEpoch}; this value only serves as a load-time floor.
+     */
     public long epoch;
 
     public ServerWaypointStore(File file) {
@@ -76,12 +81,14 @@ public class ServerWaypointStore {
     }
 
     /**
-     * Apply a client-proposed change. Assigns owner for new records and the next revision for
-     * every accepted change.
+     * Apply a client-proposed change. Assigns owner for new records and a revision drawn from the
+     * shared epoch counter for every accepted change.
      *
+     * @param revs shared revision source (WaypointEpoch::next), called once per accepted change
      * @return the authoritative record to broadcast, or null when rejected
      */
-    public synchronized WaypointRecord apply(WaypointRecord incoming, String ownerUuid, boolean isOp) {
+    public synchronized WaypointRecord apply(WaypointRecord incoming, String ownerUuid, boolean isOp,
+        LongSupplier revs) {
         if (incoming == null || incoming.id == null || incoming.id.isEmpty()) {
             return null;
         }
@@ -95,26 +102,49 @@ public class ServerWaypointStore {
                 return null; // only the owner (or an op) may delete
             }
             existing.deleted = true;
-            existing.rev = ++epoch;
+            existing.rev = revs.getAsLong();
+            epoch = Math.max(epoch, existing.rev);
             return copy(existing);
         }
 
         WaypointRecord accepted = incoming;
         accepted.owner = (existing == null || existing.owner.isEmpty()) ? ownerUuid : existing.owner;
-        accepted.rev = ++epoch;
+        accepted.rev = revs.getAsLong();
+        epoch = Math.max(epoch, accepted.rev);
         accepted.deleted = false;
         byId.put(accepted.id, accepted);
         return copy(accepted);
+    }
+
+    /** Store or replace a record verbatim (used by scope migration; revs are pre-assigned). */
+    public synchronized void put(WaypointRecord record) {
+        if (record != null && record.id != null) {
+            byId.put(record.id, record);
+            epoch = Math.max(epoch, record.rev);
+        }
     }
 
     public synchronized List<WaypointRecord> allRecords() {
         return new ArrayList<WaypointRecord>(byId.values());
     }
 
+    /** Whether this store holds a record (live or tombstone) for {@code id}. */
+    public synchronized boolean has(String id) {
+        return byId.containsKey(id);
+    }
+
     public synchronized String toJson() {
+        return toJson(epoch, byId.values());
+    }
+
+    /**
+     * Serialize an arbitrary record set in the same {@code {epoch, records[]}} wire format this
+     * store persists - used for merged (global + own scope) waypoint blobs.
+     */
+    public static String toJson(long epoch, Collection<WaypointRecord> records) {
         Stored stored = new Stored();
         stored.epoch = epoch;
-        stored.records = new ArrayList<WaypointRecord>(byId.values());
+        stored.records = new ArrayList<WaypointRecord>(records);
         return GSON.toJson(stored);
     }
 
